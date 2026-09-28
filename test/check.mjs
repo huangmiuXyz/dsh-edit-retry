@@ -228,8 +228,10 @@ const fakeT = (key) => key
 const tree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 check('render: returns host element', tree?.props?.className === 'dsh-edit-retry-host', tree?.props?.className)
 // The host is a layout-neutral block that exists only to carry the handler; the
-// shipped bubble is its single child.
-check('render: only child is the shipped bubble', tree.children[0]?.type === fakeShipped, String(tree.children[0]?.type?.name))
+// shipped bubble leads it, followed by the status and menu slots, both idle here.
+check('render: leads with the shipped bubble', tree.children[0]?.type === fakeShipped, String(tree.children[0]?.type?.name))
+check('render: renders no status while idle', tree.children[1] === null, String(tree.children[1]))
+check('render: renders no menu while closed', tree.children[2] === null, String(tree.children[2]))
 check('render: renders no edit button', !JSON.stringify(tree).includes('dsh-edit-retry-icon'))
 resolve(tree.children[0])
 check('render: forwards the t seat to the shipped bubble', shippedProps?.t === fakeT)
@@ -283,7 +285,7 @@ stateCalls.length = 0
 tree.props.onContextMenu(contextMenu(plainTarget, 1190, 790))
 check(
   'menu: clamps inside the viewport',
-  stateCalls.some((call) => call?.left === 1200 - 168 && call?.top === 800 - 36),
+  stateCalls.some((call) => call?.left === 1200 - 168 && call?.top === 800 - 68),
   JSON.stringify(stateCalls)
 )
 
@@ -300,23 +302,48 @@ const onAttachment = contextMenu(plainTarget)
 attachTree.props.onContextMenu(onAttachment)
 check('menu: ignores attachment messages', stateCalls.length === 0 && !onAttachment.prevented, JSON.stringify(stateCalls))
 
-// The open menu renders one item, and choosing it enters the editor.
+// The open menu offers both entries — direct retry first, the editor second — and
+// choosing the second enters the editor.
 // The shim's useState order is editing, busy, error, menu.
 useStateScript = [false, false, undefined, { left: 10, top: 20 }]
 const menuTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
-const menuBox = resolve(menuTree.children[1])
+const menuBox = resolve(menuTree.children[2])
 check('menu: renders the popup when open', menuBox?.props?.className === 'dsh-edit-retry-menu', String(menuBox?.props?.className))
 check('menu: positioned at the pointer', menuBox?.props?.style?.left === '10px' && menuBox?.props?.style?.top === '20px', JSON.stringify(menuBox?.props?.style))
-const menuItem = resolve((menuBox?.children ?? [])[0])
-check('menu: offers the zh edit action', menuItem?.children?.[0] === '编辑并重试', JSON.stringify(menuItem?.children))
+const menuItems = (menuBox?.children ?? []).map((child) => resolve(child))
+check('menu: offers two entries', menuItems.length === 2, String(menuItems.length))
+check('menu: offers the zh direct retry first', menuItems[0]?.children?.[0] === '直接重试', JSON.stringify(menuItems[0]?.children))
+check('menu: offers the zh edit action second', menuItems[1]?.children?.[0] === '编辑并重试', JSON.stringify(menuItems[1]?.children))
+check('menu: the two entries are distinct handlers', menuItems[0]?.props?.onClick !== menuItems[1]?.props?.onClick)
+check('menu: direct retry is enabled for non-empty text', menuItems[0]?.props?.disabled === false, String(menuItems[0]?.props?.disabled))
 stateCalls.length = 0
-menuItem?.props?.onClick?.()
-check('menu: choosing the item enters the editor', stateCalls.includes(true), JSON.stringify(stateCalls))
+menuItems[1]?.props?.onClick?.()
+check('menu: choosing the edit entry enters the editor', stateCalls.includes(true), JSON.stringify(stateCalls))
+
+// Blank text is not worth resending, so direct retry disables itself while the
+// editor stays available — it is the only way to put text on such a message.
+useStateScript = [false, false, undefined, { left: 10, top: 20 }]
+const blankTree = shim({ node: userNode(8, [text('   ')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const blankItems = (resolve(blankTree.children[2])?.children ?? []).map((child) => resolve(child))
+check('menu: direct retry is disabled for blank text', blankItems[0]?.props?.disabled === true, String(blankItems[0]?.props?.disabled))
+check('menu: the edit entry stays available for blank text', blankItems[1]?.props?.disabled === false, String(blankItems[1]?.props?.disabled))
+
+// The menu closes on click, so the status slot is the only place a direct retry
+// can report progress and failure.
+useStateScript = [false, true, undefined, undefined]
+const busyTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const busyStatus = resolve(busyTree.children[1])
+check('status: shows progress while a direct retry runs', busyStatus?.children?.[0]?.children?.[0] === '正在重试…', JSON.stringify(busyStatus?.children))
+
+useStateScript = [false, false, 'boom', undefined]
+const failedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const failedStatus = resolve(failedTree.children[1])
+check('status: reports a failed direct retry', failedStatus?.children?.[0]?.children?.[0] === '重试失败：boom', JSON.stringify(failedStatus?.children))
 
 // Closed by default: no popup competes with the shipped bubble.
 useStateScript = []
 const closedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
-check('menu: stays closed until asked', closedTree.children[1] === null, JSON.stringify(closedTree.children.length))
+check('menu: stays closed until asked', closedTree.children[2] === null, JSON.stringify(closedTree.children.length))
 
 // --- 5. submit path: fork vs fresh session, and the resend ---------------------
 const forkCalls = []
@@ -391,6 +418,30 @@ async function submitVia(seq, value, cwd, workspaceId) {
   await new Promise((done) => setTimeout(done, 0))
 }
 
+/**
+ * Drive the shim's menu and choose direct retry.
+ *
+ * Nothing here can observe "the editor was skipped" directly — the stub's setters
+ * record values, not which `useState` they belong to, and both entries set `true`
+ * once (editing vs busy). The proof is indirect and stronger: the edit entry only
+ * opens an editor and reaches the sessions service on a LATER submit, so a fork
+ * and a prompt landing on this tick can only come from the retry entry.
+ */
+async function retryDirectVia(seq, value, cwd, workspaceId) {
+  sourceWorkspaceId = workspaceId
+  useStateScript = [false, false, undefined, { left: 10, top: 20 }]
+  const host = submitShim({
+    node: userNode(seq, [text(value)]),
+    sessionId: 'session-1',
+    cwd,
+    t: fakeT,
+    useWorkspaces
+  })
+  const items = (resolve(host?.children?.[2])?.children ?? []).map((child) => resolve(child))
+  items[0]?.props?.onClick?.()
+  await new Promise((done) => setTimeout(done, 0))
+}
+
 // Retrying the FIRST prompt must not fork: a fork either cuts inside turn 1 (Host
 // synthesizes an empty closing row) or in front of it (the child inherits the
 // inbox splice still holding the ORIGINAL prompt and re-sends it).
@@ -433,6 +484,41 @@ windowEntries = [
 await submitVia(7, '窗口外')
 check('submit: a paged window never counts as "first"', createCalls.length === 0 && forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
 check('submit: paged window forks at the predecessor', forkCalls[0]?.atSeq === 6, String(forkCalls[0]?.atSeq))
+
+// --- 5b. direct retry ---------------------------------------------------------
+// Direct retry is the same path with the text untouched: it must reach the sessions
+// service without an editor round-trip, and resend the ORIGINAL bytes.
+windowHasMore = false
+windowEntries = [
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'turn/end', seq: 19 } },
+  { type: 'event', event: { type: 'turn/start', seq: 20 } },
+  { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } }
+]
+forkCalls.length = 0
+createCalls.length = 0
+promptCalls.length = 0
+opened.length = 0
+await retryDirectVia(21, '第二句', PKG, 'ws-1')
+check('direct: forks without an editor round-trip', forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
+check('direct: never falls back to a fresh session', createCalls.length === 0, JSON.stringify(createCalls))
+check('direct: forks at the message predecessor', forkCalls[0]?.atSeq === 20, String(forkCalls[0]?.atSeq))
+check('direct: resends the original text unchanged', promptCalls[0]?.content?.[0]?.text === '第二句', JSON.stringify(promptCalls[0]))
+check('direct: opens the retry session', opened[0] === 'session-child', String(opened[0]))
+
+// The first prompt still opens a fresh session on the direct path: the fork rule
+// belongs to the position of the message, not to which entry was chosen.
+forkCalls.length = 0
+createCalls.length = 0
+promptCalls.length = 0
+windowEntries = [
+  { type: 'event', event: { type: 'turn/start', seq: 4 } },
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } }
+]
+await retryDirectVia(8, '第一句', PKG, 'ws-1')
+check('direct: the first prompt still creates', createCalls.length === 1 && forkCalls.length === 0, JSON.stringify({ forkCalls, createCalls }))
+check('direct: the fresh session mirrors the Workspace', createCalls[0]?.workspaceId === 'ws-1', JSON.stringify(createCalls[0]))
+check('direct: the fresh session resends the original text', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
 
 // --- 6. combo delivery shape --------------------------------------------------
 // The browser never receives this file alone: every plugin is concatenated into

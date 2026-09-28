@@ -1,8 +1,9 @@
 // Edit-and-retry — CLIENT half.
 //
-// Right-clicking an ordinary user message opens a one-item context menu; choosing
-// it swaps the bubble for an inline editor, and saving produces a retry session
-// carrying the edited text as its prompt.
+// Right-clicking an ordinary user message opens a two-item context menu: "Retry"
+// resends the text untouched, "Edit and retry" swaps the bubble for an inline
+// editor first. Either way the result is a retry session carrying that text as its
+// prompt — the edit is optional, the retry is not.
 //
 // The context menu is the ONLY way in — there is no edit button and no
 // double-click. A button would have to live in the shipped action row (copy +
@@ -51,14 +52,15 @@ window.__ModuleLoader__.load({
     const CSS_ID = 'dsh-edit-retry/EditRetry.css'
     /** Interactive descendants keep their own context menu; never steal it. */
     const INTERACTIVE = 'a, button, [role="button"], input, textarea, select'
-    /** Menu extents used to keep the popup inside the viewport. */
+    /** Menu extents used to keep the popup inside the viewport. Two items tall. */
     const MENU_WIDTH = 168
-    const MENU_HEIGHT = 36
+    const MENU_HEIGHT = 68
 
     // --- copy -------------------------------------------------------------------
     // Read through the `locale` service on every render, so the two dictionaries
     // follow the Harness language without taking on a namespace registration.
     const ZH = {
+      retry: '直接重试',
       action: '编辑并重试',
       title: '编辑这条消息并重试',
       hint: '保存后从这里新建会话并立即发送',
@@ -68,6 +70,7 @@ window.__ModuleLoader__.load({
       failed: '重试失败：'
     }
     const EN = {
+      retry: 'Retry',
       action: 'Edit and retry',
       title: 'Edit this message and retry',
       hint: 'Saving forks a new session from here and sends immediately',
@@ -129,8 +132,12 @@ window.__ModuleLoader__.load({
   white-space: nowrap;
   cursor: pointer;
 }
-.dsh-edit-retry-menuitem:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-edit-retry-menuitem:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-edit-retry-menuitem:focus-visible { outline: 2px solid var(--dsw-alias-button-primary-fill); outline-offset: -2px; }
+.dsh-edit-retry-menuitem:disabled { cursor: default; opacity: .45; }
+/* Direct-retry feedback: the menu closes on click, so progress and failure have
+   to surface under the bubble the way the editor's own row does. */
+.dsh-edit-retry-status { padding: 4px 2px 0; }
 .dsh-edit-retry-editor {
   display: flex;
   flex-direction: column;
@@ -446,6 +453,9 @@ window.__ModuleLoader__.load({
           const data = props.node.data
           const content = data.content
           const textOnly = isTextOnly(content)
+          // The text as sent, reused verbatim by the direct retry. Trimmed exactly
+          // like the editor's own submit, so both entries send the same prompt.
+          const original = textOf(content).trim()
           // Prefer a fresh lookup: a reload can replace the shipped entry.
           const Body = shippedUserEntry(ctx, EditRetryUserNode)?.component ?? shipped.component
 
@@ -471,6 +481,15 @@ window.__ModuleLoader__.load({
             },
             [props.sessionId, props.cwd, workspaceId, data.seq]
           )
+
+          // Direct retry: the same path with the text untouched, for when the edit was
+          // never the point — the message just deserves another run. Guarded on empty
+          // text because a retry that sends nothing is not a retry.
+          const onRetryDirect = useCallback(() => {
+            setMenu(undefined)
+            if (original.length === 0 || busy) return
+            onSubmit(original)
+          }, [original, busy, onSubmit])
 
           // Opening the menu. Interactive descendants keep their own context menu,
           // so the shipped copy control and any link in the message are left alone;
@@ -532,6 +551,17 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsh-edit-retry-host', onContextMenu },
             h(Body, props),
+            // Choosing direct retry closes the menu, so its progress and its failure
+            // have nowhere else to report. Editing keeps using the editor's own row.
+            busy || error !== undefined
+              ? h(
+                  'div',
+                  { className: 'dsh-edit-retry-status' },
+                  busy
+                    ? h('span', { className: 'dsh-edit-retry-hint' }, t.sending)
+                    : h('span', { className: 'dsh-edit-retry-error' }, `${t.failed}${error}`)
+                )
+              : null,
             menu === undefined
               ? null
               : h(
@@ -548,6 +578,18 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'dsh-edit-retry-menuitem',
                       role: 'menuitem',
+                      disabled: original.length === 0 || busy,
+                      onClick: onRetryDirect
+                    },
+                    t.retry
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-edit-retry-menuitem',
+                      role: 'menuitem',
+                      disabled: busy,
                       onClick: () => {
                         setMenu(undefined)
                         setEditing(true)
