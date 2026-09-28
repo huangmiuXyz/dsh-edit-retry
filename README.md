@@ -1,6 +1,6 @@
 # dsh-edit-retry
 
-**重发任意一条用户消息。** 右键会话里的一条消息，可以**直接重试**，也可以**改完再重试** —— DSH 都从这条消息之前的位置分叉出一个新会话，把文本当作第一句话发出去。
+**重发任意一条用户消息。** 右键会话里的一条消息，可以**重试**，也可以**先改再重试** —— DSH 都从这条消息之前的位置分叉出一个新会话，把文本当作第一句话发出去。
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）客户端插件。
 
@@ -12,7 +12,7 @@
 
 | 菜单项 | 行为 |
 |---|---|
-| **直接重试** | 原样重发这条消息，不做任何编辑 |
+| **重试** | 原样重发这条消息，不做任何编辑 |
 | **编辑并重试** | 气泡原地变成编辑器（预填原文），改完再发 |
 
 编辑器里回车换行、`⌘/Ctrl + Enter` 保存、`Esc` 取消。两条路径的后续完全一样：
@@ -23,7 +23,7 @@
 
 整个过程复用的是 DSH 自带「分支」按钮的同一条路径，所以权限和行为跟原生功能一致。
 
-选择后菜单就关闭了，因此**直接重试**的进度和失败会显示在气泡下方（「正在重试…」/「重试失败：原因」）—— 编辑那条路径则复用编辑器自己的提示行。
+选择后菜单就关闭了，因此**重试**的进度和失败会显示在气泡下方（「正在重试…」/「重试失败：原因」）—— 编辑那条路径则复用编辑器自己的提示行。
 
 ## 为什么是「分叉」而不是原地改写
 
@@ -72,7 +72,7 @@ pnpm add link:/绝对路径/dsh-edit-retry
 - **右键是唯一入口。** 没有重试按钮，也没有双击 —— 按钮得挤进 DSH 自带的操作栏（复制 + 时间），而那一行渲染在自带组件内部，从外面接不进去；双击则会和浏览器「选中一个词」的手势打架。
 - **只处理纯文本消息。** 带附件的消息没法当文本重发，因此保留浏览器原生右键菜单。
 - **消息内的交互元素**（链接、按钮、输入框）保留它们自己的右键菜单，插件不会抢占。
-- **消息为空白时「直接重试」置灰** —— 重发一个空提示词没有意义；「编辑并重试」仍然可用，它也是给这种消息补上文本的唯一途径。
+- **消息为空白时「重试」置灰** —— 重发一个空提示词没有意义；「编辑并重试」仍然可用，它也是给这种消息补上文本的唯一途径。
 - **第一条消息**走「新建会话」而不是「分叉」。理由见下面的注释；简单说，在 Turn 1 内部切分会留下一个空的「用时 N 秒」行，而在 Turn 1 之前切分会让子会话重发原文。第一条之外的消息才做分叉。
 - **两条菜单项共用同一套分叉规则** —— 是消息的位置决定走新建还是分叉，跟选了哪一项无关。
 - **重试会话会落在和源会话相同的 Workspace 分组里**，不会掉进 Ungrouped。
@@ -113,7 +113,7 @@ A client-side plugin for DeepSeek Harness (DSH).
 
 - **Why fork instead of rewriting in place?** The durable log is append-only (`seq = log.length`) and the transcript renders only append-origin surface events, so an in-place surface replace would change what the *model* sees while the *screen* kept the old text. Forking is exactly the path the shipped "branch" button uses.
 - **Install:** `pnpm add github:huangmiuXyz/dsh-edit-retry` inside your profile directory, add `"dsh-edit-retry"` to that profile's `dsh.profile.bundles`, then restart DSH.
-- **Two entries:** *Retry* resends the text untouched; *Edit and retry* opens an editor first. Both share one fork rule and one resend path, so only the text differs. Because the menu closes on click, a direct retry reports progress and failure in a status line under the bubble.
+- **Two entries:** *Retry* resends the text untouched; *Edit and retry* opens an editor first. Both share one fork rule and one resend path, so only the text differs. Because the menu closes on click, the retry reports progress and failure in a status line under the bubble.
 - **Boundaries:** text-only messages are retryable (attachments keep the native menu); right-click is the only entry point; interactive descendants keep their own context menu; blank text disables *Retry* while *Edit and retry* stays available; the first human prompt opens a fresh session while later prompts fork.
 - **How:** the plugin shadows the shipped `user` chat node at priority `-1` and renders the shipped component through `ctx.slots.entries()`, forwarding its `locale` seat so the shipped bubble keeps its `t`. The client half imports nothing but React.
 - **Test:** `node test/check.mjs` — dependency-free offline self-check.

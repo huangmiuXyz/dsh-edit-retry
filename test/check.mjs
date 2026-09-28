@@ -302,7 +302,7 @@ const onAttachment = contextMenu(plainTarget)
 attachTree.props.onContextMenu(onAttachment)
 check('menu: ignores attachment messages', stateCalls.length === 0 && !onAttachment.prevented, JSON.stringify(stateCalls))
 
-// The open menu offers both entries — direct retry first, the editor second — and
+// The open menu offers both entries — retry first, the editor second — and
 // choosing the second enters the editor.
 // The shim's useState order is editing, busy, error, menu.
 useStateScript = [false, false, undefined, { left: 10, top: 20 }]
@@ -312,33 +312,33 @@ check('menu: renders the popup when open', menuBox?.props?.className === 'dsh-ed
 check('menu: positioned at the pointer', menuBox?.props?.style?.left === '10px' && menuBox?.props?.style?.top === '20px', JSON.stringify(menuBox?.props?.style))
 const menuItems = (menuBox?.children ?? []).map((child) => resolve(child))
 check('menu: offers two entries', menuItems.length === 2, String(menuItems.length))
-check('menu: offers the zh direct retry first', menuItems[0]?.children?.[0] === '直接重试', JSON.stringify(menuItems[0]?.children))
+check('menu: offers the zh retry first', menuItems[0]?.children?.[0] === '重试', JSON.stringify(menuItems[0]?.children))
 check('menu: offers the zh edit action second', menuItems[1]?.children?.[0] === '编辑并重试', JSON.stringify(menuItems[1]?.children))
 check('menu: the two entries are distinct handlers', menuItems[0]?.props?.onClick !== menuItems[1]?.props?.onClick)
-check('menu: direct retry is enabled for non-empty text', menuItems[0]?.props?.disabled === false, String(menuItems[0]?.props?.disabled))
+check('menu: retry is enabled for non-empty text', menuItems[0]?.props?.disabled === false, String(menuItems[0]?.props?.disabled))
 stateCalls.length = 0
 menuItems[1]?.props?.onClick?.()
 check('menu: choosing the edit entry enters the editor', stateCalls.includes(true), JSON.stringify(stateCalls))
 
-// Blank text is not worth resending, so direct retry disables itself while the
+// Blank text is not worth resending, so retry disables itself while the
 // editor stays available — it is the only way to put text on such a message.
 useStateScript = [false, false, undefined, { left: 10, top: 20 }]
 const blankTree = shim({ node: userNode(8, [text('   ')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const blankItems = (resolve(blankTree.children[2])?.children ?? []).map((child) => resolve(child))
-check('menu: direct retry is disabled for blank text', blankItems[0]?.props?.disabled === true, String(blankItems[0]?.props?.disabled))
+check('menu: retry is disabled for blank text', blankItems[0]?.props?.disabled === true, String(blankItems[0]?.props?.disabled))
 check('menu: the edit entry stays available for blank text', blankItems[1]?.props?.disabled === false, String(blankItems[1]?.props?.disabled))
 
-// The menu closes on click, so the status slot is the only place a direct retry
+// The menu closes on click, so the status slot is the only place a retry
 // can report progress and failure.
 useStateScript = [false, true, undefined, undefined]
 const busyTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const busyStatus = resolve(busyTree.children[1])
-check('status: shows progress while a direct retry runs', busyStatus?.children?.[0]?.children?.[0] === '正在重试…', JSON.stringify(busyStatus?.children))
+check('status: shows progress while a retry runs', busyStatus?.children?.[0]?.children?.[0] === '正在重试…', JSON.stringify(busyStatus?.children))
 
 useStateScript = [false, false, 'boom', undefined]
 const failedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const failedStatus = resolve(failedTree.children[1])
-check('status: reports a failed direct retry', failedStatus?.children?.[0]?.children?.[0] === '重试失败：boom', JSON.stringify(failedStatus?.children))
+check('status: reports a failed retry', failedStatus?.children?.[0]?.children?.[0] === '重试失败：boom', JSON.stringify(failedStatus?.children))
 
 // Closed by default: no popup competes with the shipped bubble.
 useStateScript = []
@@ -419,7 +419,7 @@ async function submitVia(seq, value, cwd, workspaceId) {
 }
 
 /**
- * Drive the shim's menu and choose direct retry.
+ * Drive the shim's menu and choose retry.
  *
  * Nothing here can observe "the editor was skipped" directly — the stub's setters
  * record values, not which `useState` they belong to, and both entries set `true`
@@ -427,7 +427,7 @@ async function submitVia(seq, value, cwd, workspaceId) {
  * opens an editor and reaches the sessions service on a LATER submit, so a fork
  * and a prompt landing on this tick can only come from the retry entry.
  */
-async function retryDirectVia(seq, value, cwd, workspaceId) {
+async function retryVia(seq, value, cwd, workspaceId) {
   sourceWorkspaceId = workspaceId
   useStateScript = [false, false, undefined, { left: 10, top: 20 }]
   const host = submitShim({
@@ -485,8 +485,8 @@ await submitVia(7, '窗口外')
 check('submit: a paged window never counts as "first"', createCalls.length === 0 && forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
 check('submit: paged window forks at the predecessor', forkCalls[0]?.atSeq === 6, String(forkCalls[0]?.atSeq))
 
-// --- 5b. direct retry ---------------------------------------------------------
-// Direct retry is the same path with the text untouched: it must reach the sessions
+// --- 5b. retry ---------------------------------------------------------
+// Retry is the same path with the text untouched: it must reach the sessions
 // service without an editor round-trip, and resend the ORIGINAL bytes.
 windowHasMore = false
 windowEntries = [
@@ -499,14 +499,14 @@ forkCalls.length = 0
 createCalls.length = 0
 promptCalls.length = 0
 opened.length = 0
-await retryDirectVia(21, '第二句', PKG, 'ws-1')
-check('direct: forks without an editor round-trip', forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
-check('direct: never falls back to a fresh session', createCalls.length === 0, JSON.stringify(createCalls))
-check('direct: forks at the message predecessor', forkCalls[0]?.atSeq === 20, String(forkCalls[0]?.atSeq))
-check('direct: resends the original text unchanged', promptCalls[0]?.content?.[0]?.text === '第二句', JSON.stringify(promptCalls[0]))
-check('direct: opens the retry session', opened[0] === 'session-child', String(opened[0]))
+await retryVia(21, '第二句', PKG, 'ws-1')
+check('retry: forks without an editor round-trip', forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
+check('retry: never falls back to a fresh session', createCalls.length === 0, JSON.stringify(createCalls))
+check('retry: forks at the message predecessor', forkCalls[0]?.atSeq === 20, String(forkCalls[0]?.atSeq))
+check('retry: resends the original text unchanged', promptCalls[0]?.content?.[0]?.text === '第二句', JSON.stringify(promptCalls[0]))
+check('retry: opens the retry session', opened[0] === 'session-child', String(opened[0]))
 
-// The first prompt still opens a fresh session on the direct path: the fork rule
+// The first prompt still opens a fresh session on the retry path: the fork rule
 // belongs to the position of the message, not to which entry was chosen.
 forkCalls.length = 0
 createCalls.length = 0
@@ -515,10 +515,10 @@ windowEntries = [
   { type: 'event', event: { type: 'turn/start', seq: 4 } },
   { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } }
 ]
-await retryDirectVia(8, '第一句', PKG, 'ws-1')
-check('direct: the first prompt still creates', createCalls.length === 1 && forkCalls.length === 0, JSON.stringify({ forkCalls, createCalls }))
-check('direct: the fresh session mirrors the Workspace', createCalls[0]?.workspaceId === 'ws-1', JSON.stringify(createCalls[0]))
-check('direct: the fresh session resends the original text', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
+await retryVia(8, '第一句', PKG, 'ws-1')
+check('retry: the first prompt still creates', createCalls.length === 1 && forkCalls.length === 0, JSON.stringify({ forkCalls, createCalls }))
+check('retry: the fresh session mirrors the Workspace', createCalls[0]?.workspaceId === 'ws-1', JSON.stringify(createCalls[0]))
+check('retry: the fresh session resends the original text', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
 
 // --- 6. combo delivery shape --------------------------------------------------
 // The browser never receives this file alone: every plugin is concatenated into

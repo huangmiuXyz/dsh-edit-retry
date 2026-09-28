@@ -60,7 +60,7 @@ window.__ModuleLoader__.load({
     // Read through the `locale` service on every render, so the two dictionaries
     // follow the Harness language without taking on a namespace registration.
     const ZH = {
-      retry: '直接重试',
+      retry: '重试',
       action: '编辑并重试',
       title: '编辑这条消息并重试',
       hint: '保存后从这里新建会话并立即发送',
@@ -135,7 +135,7 @@ window.__ModuleLoader__.load({
 .dsh-edit-retry-menuitem:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-edit-retry-menuitem:focus-visible { outline: 2px solid var(--dsw-alias-button-primary-fill); outline-offset: -2px; }
 .dsh-edit-retry-menuitem:disabled { cursor: default; opacity: .45; }
-/* Direct-retry feedback: the menu closes on click, so progress and failure have
+/* Retry feedback: the menu closes on click, so progress and failure have
    to surface under the bubble the way the editor's own row does. */
 .dsh-edit-retry-status { padding: 4px 2px 0; }
 .dsh-edit-retry-editor {
@@ -453,7 +453,7 @@ window.__ModuleLoader__.load({
           const data = props.node.data
           const content = data.content
           const textOnly = isTextOnly(content)
-          // The text as sent, reused verbatim by the direct retry. Trimmed exactly
+          // The text as sent, reused verbatim by the retry. Trimmed exactly
           // like the editor's own submit, so both entries send the same prompt.
           const original = textOf(content).trim()
           // Prefer a fresh lookup: a reload can replace the shipped entry.
@@ -482,10 +482,10 @@ window.__ModuleLoader__.load({
             [props.sessionId, props.cwd, workspaceId, data.seq]
           )
 
-          // Direct retry: the same path with the text untouched, for when the edit was
+          // Retry: the same path with the text untouched, for when the edit was
           // never the point — the message just deserves another run. Guarded on empty
           // text because a retry that sends nothing is not a retry.
-          const onRetryDirect = useCallback(() => {
+          const onRetry = useCallback(() => {
             setMenu(undefined)
             if (original.length === 0 || busy) return
             onSubmit(original)
@@ -551,7 +551,7 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsh-edit-retry-host', onContextMenu },
             h(Body, props),
-            // Choosing direct retry closes the menu, so its progress and its failure
+            // Choosing retry closes the menu, so its progress and its failure
             // have nowhere else to report. Editing keeps using the editor's own row.
             busy || error !== undefined
               ? h(
@@ -579,7 +579,7 @@ window.__ModuleLoader__.load({
                       className: 'dsh-edit-retry-menuitem',
                       role: 'menuitem',
                       disabled: original.length === 0 || busy,
-                      onClick: onRetryDirect
+                      onClick: onRetry
                     },
                     t.retry
                   ),
