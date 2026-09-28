@@ -54,7 +54,22 @@ DSH 的持久化日志是**只能追加**的（`seq = log.length`），而且会
 
 ## 安装
 
-把插件装进某个 profile 的依赖里，再把它登记进该 profile 的 bundle 列表。
+插件是装进某个 profile 的**普通依赖**，并在该 profile 的 `dsh.profile.bundles` 里登记一层：
+
+```bash
+dsh plugin --profile <你的 profile> add github:huangmiuXyz/dsh-edit-retry
+```
+
+`dsh plugin` 就是把参数转发给该 profile 目录里的 pnpm，装完再**自动**把新依赖登记进 `dsh.profile.bundles` —— 本包声明了 `dsh.bundle`，所以这一步不用手改 `package.json`。重启 DSH（或刷新 Web 界面）即可生效。
+
+> **为什么是 `github:` 而不是裸包名？** 本包还没发布到 npm，`add dsh-edit-retry` 会 404；GitHub 源是当前唯一可用的写法。包内没有 `prepare`／构建脚本，所以也不会被 pnpm 的构建脚本审批（`allowBuilds`）挡住。
+
+> **桌面端（DSH Desktop）**：`--profile desktop` 由 Electron 应用独占，`dsh plugin` 会直接拒绝（`profile "desktop" is managed exclusively by the Electron application`），所以桌面端这份要在应用内的插件管理入口里装同一个 GitHub 源。
+
+> **如果该 profile 的 `dsh.profile.bundles` 里有解析不到的条目**（典型是指向已删除目录的 `link:` 包），`dsh plugin` 会在包**装完之后**的登记阶段报错退出、不写 bundles —— 依赖其实已经装好了。清掉那条悬空条目再跑一次，或者直接按下面的手动做法补 bundle。
+
+<details>
+<summary>手动等价做法（不用 CLI）</summary>
 
 ```bash
 cd ~/.dsh/profiles/<你的 profile>
@@ -77,18 +92,17 @@ pnpm add github:huangmiuXyz/dsh-edit-retry
 }
 ```
 
-重启 DSH（或刷新 Web 界面）即可生效。
+</details>
 
 ### 从本地克隆安装
 
 开发时用 `link:` 更顺手，改完代码刷新页面就生效，不用重新装包：
 
 ```bash
-cd ~/.dsh/profiles/<你的 profile>
-pnpm add link:/绝对路径/dsh-edit-retry
+dsh plugin --profile <你的 profile> add link:/绝对路径/dsh-edit-retry
 ```
 
-同样要把 `"dsh-edit-retry"` 加进 `dsh.profile.bundles`。
+bundle 登记同上 —— `dsh plugin` 会自动做，手动做法见上面的折叠块。
 
 ## 行为与边界
 
@@ -136,7 +150,7 @@ node test/check.mjs
 A DSH plugin with both halves.
 
 - **Why fork instead of rewriting in place?** The durable log is append-only (`seq = log.length`) and the transcript renders only append-origin surface events, so an in-place surface replace would change what the *model* sees while the *screen* kept the old text. Forking is exactly the path the shipped "branch" button uses.
-- **Install:** `pnpm add github:huangmiuXyz/dsh-edit-retry` inside your profile directory, add `"dsh-edit-retry"` to that profile's `dsh.profile.bundles`, then restart DSH.
+- **Install:** `dsh plugin --profile <profile> add github:huangmiuXyz/dsh-edit-retry`, then restart DSH. The CLI forwards to pnpm in the profile directory and registers the bundle entry for you. The bare name does not resolve yet — the package is not on npm — and the Desktop app's own profile (`--profile desktop`) refuses the CLI, so install it there through the in-app plugin manager instead.
 - **Two entries:** *Retry* resends the text untouched; *Edit and retry* opens an editor first. Both share one fork rule and one resend path, so only the text differs. Because the menu closes on click, the operation reports progress and failure in a status line under the bubble.
 - **Deleting the source is opt-in and permanent.** DSH gives client plugins no way to delete a session — the workspace surface only archives, and the session store has no public remove API — so the delete lives in the **host half** and is reached over an HTTP route the host registers. It force-stops the agent, flushes, detaches the live entry, removes the on-disk log in both id spellings, *confirms it is gone*, and only then clears the workspace and projection accounting, because a half-deleted session is worse than an undeleted one. It runs only after the retry actually got in flight: a failed retry leaves the source alone. The route requires a custom header, which is what forces a CORS preflight and keeps other pages out, and session ids are charset-validated and path-containment-checked before touching the filesystem.
 - **Boundaries:** text-only messages are retryable (attachments keep the native menu); right-click is the only entry point; interactive descendants keep their own context menu; blank text disables *Retry* while *Edit and retry* stays available; the first human prompt opens a fresh session while later prompts fork.
