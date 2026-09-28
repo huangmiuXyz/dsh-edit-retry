@@ -5,11 +5,14 @@
 // harness happily agreed, while the live Chat view node carries the message
 // record as `node.data` (`chatNode(context, kind, anchorSeq, state)`).
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /** Repo root, resolved from this file so the check runs from any checkout. */
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+/** The client half's source, read fresh (the combo check also evaluates it). */
+const ownClientSource = () => fs.readFileSync(path.join(PKG, 'src', 'client.js'), 'utf8')
 let failures = 0
 function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail === undefined ? '' : '  — ' + detail}`)
@@ -285,7 +288,7 @@ stateCalls.length = 0
 tree.props.onContextMenu(contextMenu(plainTarget, 1190, 790))
 check(
   'menu: clamps inside the viewport',
-  stateCalls.some((call) => call?.left === 1200 - 168 && call?.top === 800 - 68),
+  stateCalls.some((call) => call?.left === 1200 - 168 && call?.top === 800 - 108),
   JSON.stringify(stateCalls)
 )
 
@@ -302,27 +305,43 @@ const onAttachment = contextMenu(plainTarget)
 attachTree.props.onContextMenu(onAttachment)
 check('menu: ignores attachment messages', stateCalls.length === 0 && !onAttachment.prevented, JSON.stringify(stateCalls))
 
-// The open menu offers both entries — retry first, the editor second — and
-// choosing the second enters the editor.
-// The shim's useState order is editing, busy, error, menu.
-useStateScript = [false, false, undefined, { left: 10, top: 20 }]
+// The open menu offers two entries — retry first, the editor second, then a rule
+// and the delete-source toggle — and choosing the second enters the editor.
+// The shim's useState order is editing, busy, error, menu, deleteSource.
+useStateScript = [false, undefined, undefined, { left: 10, top: 20 }, false]
 const menuTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const menuBox = resolve(menuTree.children[2])
 check('menu: renders the popup when open', menuBox?.props?.className === 'dsh-edit-retry-menu', String(menuBox?.props?.className))
 check('menu: positioned at the pointer', menuBox?.props?.style?.left === '10px' && menuBox?.props?.style?.top === '20px', JSON.stringify(menuBox?.props?.style))
 const menuItems = (menuBox?.children ?? []).map((child) => resolve(child))
-check('menu: offers two entries', menuItems.length === 2, String(menuItems.length))
+check('menu: offers four rows', menuItems.length === 4, String(menuItems.length))
 check('menu: offers the zh retry first', menuItems[0]?.children?.[0] === '重试', JSON.stringify(menuItems[0]?.children))
 check('menu: offers the zh edit action second', menuItems[1]?.children?.[0] === '编辑并重试', JSON.stringify(menuItems[1]?.children))
 check('menu: the two entries are distinct handlers', menuItems[0]?.props?.onClick !== menuItems[1]?.props?.onClick)
 check('menu: retry is enabled for non-empty text', menuItems[0]?.props?.disabled === false, String(menuItems[0]?.props?.disabled))
+check('menu: separates the toggle from the actions', menuItems[2]?.props?.className === 'dsh-edit-retry-separator', String(menuItems[2]?.props?.className))
+check('menu: offers the zh delete-source toggle last', menuItems[3]?.children?.[1] === '重试后删除原会话', JSON.stringify(menuItems[3]?.children))
+check('menu: the toggle is a checkbox, not an action', menuItems[3]?.props?.role === 'menuitemcheckbox', String(menuItems[3]?.props?.role))
+check('menu: the toggle starts unchecked', menuItems[3]?.props?.['aria-checked'] === false, String(menuItems[3]?.props?.['aria-checked']))
 stateCalls.length = 0
 menuItems[1]?.props?.onClick?.()
 check('menu: choosing the edit entry enters the editor', stateCalls.includes(true), JSON.stringify(stateCalls))
 
+// Marking the toggle actually marks it — the visual tick is driven by the flag,
+// and an armed toggle must survive into the retry that follows.
+stateCalls.length = 0
+menuItems[3]?.props?.onClick?.()
+check('menu: choosing the toggle flips it on', stateCalls.includes(true), JSON.stringify(stateCalls))
+useStateScript = [false, undefined, undefined, { left: 10, top: 20 }, true]
+const armedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const armedToggle = resolve(resolve(armedTree.children[2])?.children?.[3])
+check('menu: an armed toggle shows a tick', armedToggle?.props?.['aria-checked'] === true, String(armedToggle?.props?.['aria-checked']))
+check('menu: an armed toggle renders the tick glyph', armedToggle?.children?.[0]?.children?.[0] === '✓', JSON.stringify(armedToggle?.children?.[0]))
+check('menu: the toggle is operable while idle', armedToggle?.props?.disabled === false, String(armedToggle?.props?.disabled))
+
 // Blank text is not worth resending, so retry disables itself while the
 // editor stays available — it is the only way to put text on such a message.
-useStateScript = [false, false, undefined, { left: 10, top: 20 }]
+useStateScript = [false, undefined, undefined, { left: 10, top: 20 }, false]
 const blankTree = shim({ node: userNode(8, [text('   ')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const blankItems = (resolve(blankTree.children[2])?.children ?? []).map((child) => resolve(child))
 check('menu: retry is disabled for blank text', blankItems[0]?.props?.disabled === true, String(blankItems[0]?.props?.disabled))
@@ -330,15 +349,28 @@ check('menu: the edit entry stays available for blank text', blankItems[1]?.prop
 
 // The menu closes on click, so the status slot is the only place a retry
 // can report progress and failure.
-useStateScript = [false, true, undefined, undefined]
+useStateScript = [false, 'retry', undefined, undefined]
 const busyTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const busyStatus = resolve(busyTree.children[1])
 check('status: shows progress while a retry runs', busyStatus?.children?.[0]?.children?.[0] === '正在重试…', JSON.stringify(busyStatus?.children))
 
-useStateScript = [false, false, 'boom', undefined]
+// The error slot carries its own label, so a retry failure and a delete failure
+// are distinguishable rather than both claiming the retry failed.
+useStateScript = [false, undefined, '重试失败：boom', undefined]
 const failedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 const failedStatus = resolve(failedTree.children[1])
 check('status: reports a failed retry', failedStatus?.children?.[0]?.children?.[0] === '重试失败：boom', JSON.stringify(failedStatus?.children))
+
+// During the delete half the SAME slot must say what is actually happening.
+useStateScript = [false, 'delete', undefined, undefined]
+const deletingTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const deletingStatus = resolve(deletingTree.children[1])
+check('status: names the delete phase, not the retry phase', deletingStatus?.children?.[0]?.children?.[0] === '正在删除原会话…', JSON.stringify(deletingStatus?.children))
+
+useStateScript = [false, undefined, '删除原会话失败：nope', undefined]
+const deleteFailedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const deleteFailedStatus = resolve(deleteFailedTree.children[1])
+check('status: reports a failed delete', deleteFailedStatus?.children?.[0]?.children?.[0] === '删除原会话失败：nope', JSON.stringify(deleteFailedStatus?.children))
 
 // Closed by default: no popup competes with the shipped bubble.
 useStateScript = []
@@ -402,9 +434,11 @@ const { slots: submitSlots } = runApply('lowest', 'chat', {
 const submitShim = submitSlots.__entries.find((e) => e.component !== fakeShipped).component
 
 /** Drive the shim into its editor and click submit. */
-async function submitVia(seq, value, cwd, workspaceId) {
+async function submitVia(seq, value, cwd, workspaceId, armed = false) {
   sourceWorkspaceId = workspaceId
-  useStateScript = [true]
+  // The shim's useState order is editing, busy, error, menu, deleteSource; an
+  // omitted tail falls back to that slot's own initial value.
+  useStateScript = armed ? [true, undefined, undefined, undefined, true] : [true]
   const host = submitShim({
     node: userNode(seq, [text(value)]),
     sessionId: 'session-1',
@@ -429,7 +463,7 @@ async function submitVia(seq, value, cwd, workspaceId) {
  */
 async function retryVia(seq, value, cwd, workspaceId) {
   sourceWorkspaceId = workspaceId
-  useStateScript = [false, false, undefined, { left: 10, top: 20 }]
+  useStateScript = [false, undefined, undefined, { left: 10, top: 20 }]
   const host = submitShim({
     node: userNode(seq, [text(value)]),
     sessionId: 'session-1',
@@ -519,6 +553,215 @@ await retryVia(8, '第一句', PKG, 'ws-1')
 check('retry: the first prompt still creates', createCalls.length === 1 && forkCalls.length === 0, JSON.stringify({ forkCalls, createCalls }))
 check('retry: the fresh session mirrors the Workspace', createCalls[0]?.workspaceId === 'ws-1', JSON.stringify(createCalls[0]))
 check('retry: the fresh session resends the original text', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
+
+// --- 5c. the delete-the-source half -------------------------------------------
+// Client and host are separate module graphs with no shared import, so the route
+// and header are spelled twice. Assert the two spellings agree, or the feature
+// would silently 404 forever.
+const host = await import(path.join(PKG, 'src', 'index.js'))
+check('delete: the client and host agree on the route', ownClientSource().includes(`'${host.ROUTE}'`), host.ROUTE)
+check('delete: the client and host agree on the header', ownClientSource().includes(`'${host.HEADER}'`), host.HEADER)
+
+const fetchCalls = []
+let fetchReply = { ok: true, status: 200, payload: { ok: true, sessionId: 'session-1', dirsRemoved: 1 } }
+globalThis.fetch = async (url, options) => {
+  fetchCalls.push({ url, options })
+  return {
+    ok: fetchReply.ok,
+    status: fetchReply.status,
+    json: async () => fetchReply.payload
+  }
+}
+
+// Armed: the retry lands first, then the source is deleted through the host route.
+forkCalls.length = 0
+promptCalls.length = 0
+fetchCalls.length = 0
+stateCalls.length = 0
+windowEntries = [
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'turn/end', seq: 19 } },
+  { type: 'event', event: { type: 'turn/start', seq: 20 } },
+  { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } }
+]
+await submitVia(21, '改过的', PKG, 'ws-1', true)
+check('delete: an armed retry posts to the host route', fetchCalls[0]?.url === host.ROUTE, JSON.stringify(fetchCalls[0]?.url))
+check('delete: the request is a POST', fetchCalls[0]?.options?.method === 'POST', String(fetchCalls[0]?.options?.method))
+check('delete: the request carries the guard header', fetchCalls[0]?.options?.headers?.[host.HEADER] === '1', JSON.stringify(fetchCalls[0]?.options?.headers))
+check('delete: it names the SOURCE session, not the retry', JSON.parse(fetchCalls[0]?.options?.body ?? '{}').sessionId === 'session-1', String(fetchCalls[0]?.options?.body))
+check('delete: the retry is sent before the delete', promptCalls.length === 1 && fetchCalls.length === 1, JSON.stringify({ promptCalls: promptCalls.length, fetchCalls: fetchCalls.length }))
+check('delete: the phase is announced before the call', stateCalls.includes('delete'), JSON.stringify(stateCalls))
+
+// Disarmed: the very same retry must not touch the source at all.
+forkCalls.length = 0
+fetchCalls.length = 0
+await submitVia(21, '改过的', PKG, 'ws-1', false)
+check('delete: a disarmed retry never calls the route', fetchCalls.length === 0, JSON.stringify(fetchCalls))
+
+// A failed retry must NOT delete the source: the retry never got in flight, so
+// removing the original would destroy the only copy of the conversation.
+forkCalls.length = 0
+fetchCalls.length = 0
+const realFork = sessions.fork
+sessions.fork = () => Promise.reject(new Error('fork exploded'))
+await submitVia(21, '改过的', PKG, 'ws-1', true)
+check('delete: a failed retry leaves the source alone', fetchCalls.length === 0, JSON.stringify(fetchCalls))
+sessions.fork = realFork
+
+// A failed DELETE is reported as a delete failure, not as a retry failure.
+forkCalls.length = 0
+fetchCalls.length = 0
+stateCalls.length = 0
+fetchReply = { ok: false, status: 500, payload: { ok: false, error: 'session log could not be removed' } }
+await submitVia(21, '改过的', PKG, 'ws-1', true)
+check('delete: a rejected delete surfaces the host error', stateCalls.some((call) => typeof call === 'string' && call.startsWith('删除原会话失败：') && call.includes('session log could not be removed')), JSON.stringify(stateCalls))
+fetchReply = { ok: true, status: 200, payload: { ok: true } }
+
+// --- 5d. host half: the delete itself ------------------------------------------
+// The host half is driven for real: a temporary DSH_HOME holds actual session
+// directories, so the filesystem behaviour under test is the real one.
+const SESSION = '11111111-2222-3333-4444-555555555555'
+const OTHER = '99999999-8888-7777-6666-555555555555'
+const dshHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-edit-retry-'))
+const previousHome = process.env.DSH_HOME
+process.env.DSH_HOME = dshHome
+
+const slugA = path.join(dshHome, 'sessions', '--slug-a--')
+const slugB = path.join(dshHome, 'sessions', '--slug-b--')
+// The two id spellings live under different slugs, as they do in a real store.
+const prefixedDir = path.join(slugA, `session-${SESSION}`)
+const rawDir = path.join(slugB, SESSION)
+const survivorDir = path.join(slugA, `session-${OTHER}`)
+for (const dir of [prefixedDir, rawDir, survivorDir]) {
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'session.jsonl.zstd'), 'log')
+}
+
+function fakeTable(initial) {
+  const map = new Map(Object.entries(initial))
+  return {
+    get: (key) => map.get(key),
+    put: async (key, value) => { map.set(key, value) },
+    delete: async (key) => { map.delete(key) },
+    entries: () => [...map.entries()],
+    __map: map
+  }
+}
+const projectionTable = fakeTable({ [SESSION]: { rows: {} }, [OTHER]: { rows: {} } })
+let workspaceRow = { workspaceId: 'ws-1', sessionIds: [SESSION, OTHER] }
+const workspaceTable = fakeTable({ 'ws-1': workspaceRow })
+let globalState = { archivedSessionIds: [SESSION] }
+const storageDomain = {
+  get: (name) => {
+    if (name === 'session_projcache') return { table: (table) => (table === 'sessions' ? projectionTable : undefined) }
+    if (name === 'workspace') {
+      return {
+        table: (table) => (table === 'workspaces' ? workspaceTable : undefined),
+        global: { get: () => globalState, set: async (next) => { globalState = next } }
+      }
+    }
+    return undefined
+  }
+}
+
+let idleResolved = false
+const agents = { get: (id) => (id === SESSION ? { cancel: () => { idleResolved = 'cancelled' }, whenIdle: async () => { idleResolved = 'idle' } } : undefined) }
+const flushed = []
+const liveSessions = { flush: async (session) => { flushed.push(session) }, get: (id) => (id === `session-${SESSION}` ? { id } : undefined) }
+const routes = new Map()
+const webServer = { register: ({ kind, path: routePath, handler }) => { routes.set(routePath, { kind, handler }); return () => routes.delete(routePath) } }
+
+const hostEffects = []
+const hostCtx = {
+  get: (name) => ({ webServer, agents, sessions: liveSessions, storageDomain })[name],
+  inject: () => {},
+  effect: (callback, label) => { const dispose = callback(); hostEffects.push({ label, dispose }); return () => {} }
+}
+host.apply(hostCtx)
+check('host: registers the delete route', routes.has(host.ROUTE), [...routes.keys()].join(','))
+check('host: the route is an exact match', routes.get(host.ROUTE)?.kind === 'exact', String(routes.get(host.ROUTE)?.kind))
+check('host: registration belongs to an effect', hostEffects.some((e) => String(e.label).includes('delete route')), JSON.stringify(hostEffects.map((e) => e.label)))
+
+/** A request whose body arrives asynchronously, like a real stream. */
+function makeReq({ method = 'POST', headers = {}, body = '' } = {}) {
+  const listeners = {}
+  const req = {
+    method,
+    headers,
+    on(event, listener) { (listeners[event] ??= []).push(listener); return req },
+    destroy() {}
+  }
+  queueMicrotask(() => {
+    if (body) for (const listener of listeners.data ?? []) listener(Buffer.from(body))
+    for (const listener of listeners.end ?? []) listener()
+  })
+  return req
+}
+function makeRes() {
+  const res = { status: undefined, headers: undefined, body: undefined }
+  res.writeHead = (status, headers) => { res.status = status; res.headers = headers }
+  res.end = (body) => { res.body = body }
+  return res
+}
+
+// Guards first: the route is destructive, so everything it refuses must be refused
+// before any path is touched.
+const route = routes.get(host.ROUTE).handler
+let guardRes = makeRes()
+await route(makeReq({ method: 'GET', headers: { [host.HEADER]: '1' } }), guardRes)
+check('host: refuses a non-POST', guardRes.status === 405, String(guardRes.status))
+
+guardRes = makeRes()
+await route(makeReq({ body: JSON.stringify({ sessionId: SESSION }) }), guardRes)
+check('host: refuses a request without the guard header', guardRes.status === 403, String(guardRes.status))
+
+guardRes = makeRes()
+await route(makeReq({ headers: { [host.HEADER]: '1' }, body: '{' }), guardRes)
+check('host: refuses a malformed body', guardRes.status === 400, String(guardRes.status))
+
+// Path traversal is the one that would be catastrophic: prove it is refused by
+// id shape AND that nothing outside the sessions root is reachable.
+const escapeDir = path.join(dshHome, 'escape')
+fs.mkdirSync(escapeDir, { recursive: true })
+fs.writeFileSync(path.join(escapeDir, 'keep.txt'), 'keep')
+let escapeError
+try {
+  await host.deleteSession(hostCtx, '../../escape')
+} catch (error) {
+  escapeError = error
+}
+check('host: refuses a traversal id', escapeError !== undefined, String(escapeError?.message))
+check('host: nothing outside the root was touched', fs.existsSync(path.join(escapeDir, 'keep.txt')))
+check('host: variant spellings cover both forms', host.idVariants(`session-${SESSION}`).length === 2 && host.idVariants(`session-${SESSION}`).includes(SESSION), JSON.stringify(host.idVariants(`session-${SESSION}`)))
+check('host: containment rejects a sibling', host.isInside(slugA, path.join(dshHome, 'sessions', 'other')) === false)
+check('host: finds both id spellings on disk', host.findSessionDirs(SESSION).length === 2, JSON.stringify(host.findSessionDirs(SESSION)))
+
+// The real delete.
+const deleteRes = makeRes()
+await route(makeReq({ headers: { [host.HEADER]: '1' }, body: JSON.stringify({ sessionId: SESSION }) }), deleteRes)
+const report = JSON.parse(deleteRes.body ?? '{}')
+check('host: reports success', deleteRes.status === 200 && report.ok === true, String(deleteRes.body))
+check('host: stopped the running agent', report.stopped === true && idleResolved === 'idle', JSON.stringify({ stopped: report.stopped, idleResolved }))
+check('host: flushed the live session before deleting', flushed.length === 1 && report.flushed === true, JSON.stringify(flushed))
+check('host: removed the prefixed log directory', !fs.existsSync(prefixedDir))
+check('host: removed the raw-uuid log directory', !fs.existsSync(rawDir))
+check('host: left the unrelated session alone', fs.existsSync(path.join(survivorDir, 'session.jsonl.zstd')))
+check('host: removed the projection row', projectionTable.get(SESSION) === undefined && report.projectionRemoved === true, String(projectionTable.get(SESSION)))
+check('host: left the other projection row alone', projectionTable.get(OTHER) !== undefined)
+check('host: dropped the session from its workspace', workspaceTable.get('ws-1')?.sessionIds?.join(',') === OTHER, JSON.stringify(workspaceTable.get('ws-1')))
+check('host: dropped the session from the archive set', globalState.archivedSessionIds.join(',') === '', JSON.stringify(globalState.archivedSessionIds))
+check('host: reports the workspace cleanup', report.workspaceRemoved === true, String(report.workspaceRemoved))
+
+// A session that is already gone is a 404, not a silent success — the client has
+// to be able to tell "nothing to do" from "done".
+const ABSENT = '00000000-0000-0000-0000-000000000000'
+const missingRes = makeRes()
+await route(makeReq({ headers: { [host.HEADER]: '1' }, body: JSON.stringify({ sessionId: ABSENT }) }), missingRes)
+check('host: a session with no rows and no log is not found', missingRes.status === 404, String(missingRes.body))
+
+process.env.DSH_HOME = previousHome
+fs.rmSync(dshHome, { recursive: true, force: true })
+delete globalThis.fetch
 
 // --- 6. combo delivery shape --------------------------------------------------
 // The browser never receives this file alone: every plugin is concatenated into

@@ -1,9 +1,9 @@
 {
   "name": "dsh-edit-retry",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Retry any user message, with or without editing it first: forks the session at the event before the message, opens the child, and sends the text. · 重发任意一条用户消息：可直接重试，也可改完再重试。",
+  "description": "Retry any user message, with or without editing it first, and optionally delete the session it came from: forks at the event before the message, opens the child, sends the text, then removes the source log. · 重发任意一条用户消息：可直接重试，也可改完再重试，还可选择重试后删除原会话。",
   "license": "MIT",
   "repository": {
     "type": "git",

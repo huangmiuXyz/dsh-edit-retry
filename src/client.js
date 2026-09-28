@@ -1,9 +1,15 @@
 // Edit-and-retry — CLIENT half.
 //
-// Right-clicking an ordinary user message opens a two-item context menu: "Retry"
-// resends the text untouched, "Edit and retry" swaps the bubble for an inline
-// editor first. Either way the result is a retry session carrying that text as its
-// prompt — the edit is optional, the retry is not.
+// Right-clicking an ordinary user message opens a context menu: "Retry" resends the
+// text untouched, "Edit and retry" swaps the bubble for an inline editor first, and a
+// separated toggle below them arms "delete the source session once the retry is in
+// flight".
+//
+// Either entry produces a retry session carrying that text as its prompt — the edit
+// is optional, the retry is not. The delete is opt-in and permanent, so it runs only
+// after the retry has actually been handed to the host: a retry that failed leaves
+// the source untouched. The delete itself cannot happen here; it is the host half's
+// job (see src/index.js), reached over the route the constants below name.
 //
 // The context menu is the ONLY way in — there is no edit button and no
 // double-click. A button would have to live in the shipped action row (copy +
@@ -52,9 +58,18 @@ window.__ModuleLoader__.load({
     const CSS_ID = 'dsh-edit-retry/EditRetry.css'
     /** Interactive descendants keep their own context menu; never steal it. */
     const INTERACTIVE = 'a, button, [role="button"], input, textarea, select'
-    /** Menu extents used to keep the popup inside the viewport. Two items tall. */
+    /** Menu extents used to keep the popup inside the viewport. Three rows + rule. */
     const MENU_WIDTH = 168
-    const MENU_HEIGHT = 68
+    const MENU_HEIGHT = 108
+    /**
+     * The host half's delete route and the header it insists on. These MUST match
+     * `src/index.js` — client and host are separate module graphs with no shared
+     * import, so the self-check asserts the two spellings agree.
+     */
+    const DELETE_ROUTE = '/dsh-edit-retry/session/delete'
+    const DELETE_HEADER = 'x-dsh-edit-retry'
+    /** Where the "delete the source session" choice is remembered. */
+    const PREF_KEY = 'dsh-edit-retry:delete-source'
 
     // --- copy -------------------------------------------------------------------
     // Read through the `locale` service on every render, so the two dictionaries
@@ -62,22 +77,28 @@ window.__ModuleLoader__.load({
     const ZH = {
       retry: '重试',
       action: '编辑并重试',
+      deleteSource: '重试后删除原会话',
       title: '编辑这条消息并重试',
       hint: '保存后从这里新建会话并立即发送',
       submit: '保存并重试',
       cancel: '取消',
       sending: '正在重试…',
-      failed: '重试失败：'
+      deleting: '正在删除原会话…',
+      failed: '重试失败：',
+      deleteFailed: '删除原会话失败：'
     }
     const EN = {
       retry: 'Retry',
       action: 'Edit and retry',
+      deleteSource: 'Delete the original session',
       title: 'Edit this message and retry',
       hint: 'Saving forks a new session from here and sends immediately',
       submit: 'Save and retry',
       cancel: 'Cancel',
       sending: 'Retrying…',
-      failed: 'Retry failed: '
+      deleting: 'Deleting the original session…',
+      failed: 'Retry failed: ',
+      deleteFailed: 'Could not delete the original session: '
     }
 
     function copyFor(ctx) {
@@ -91,6 +112,48 @@ window.__ModuleLoader__.load({
         language = typeof navigator !== 'undefined' ? navigator.language : undefined
       }
       return String(language ?? 'en').toLowerCase().startsWith('zh') ? ZH : EN
+    }
+
+    // --- the delete-the-source preference ----------------------------------------
+    // Deletion is permanent, so it is opt-in and remembered: a user who turns it on
+    // once should not have to re-arm it on every message. Storage access is wrapped
+    // because a locked-down browser profile can throw on localStorage itself.
+    function readDeletePref() {
+      try {
+        return window.localStorage.getItem(PREF_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    function writeDeletePref(on) {
+      try {
+        window.localStorage.setItem(PREF_KEY, on ? '1' : '0')
+      } catch {
+        /* the choice still applies to this render tree */
+      }
+    }
+
+    // --- deleting the source session ---------------------------------------------
+    /**
+     * Ask the host half to delete the session the retry came from.
+     *
+     * The header is not decoration: it is what forces a CORS preflight, which the
+     * host answers by refusing, so a random page cannot reach this route. Same
+     * origin, so no credentials handling is needed.
+     * @returns the host's report.
+     */
+    async function deleteSourceSession(sessionId) {
+      const response = await fetch(DELETE_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [DELETE_HEADER]: '1' },
+        body: JSON.stringify({ sessionId })
+      })
+      const payload = await response.json().catch(() => undefined)
+      if (!response.ok || payload?.ok !== true) {
+        throw new Error(payload?.error ?? `HTTP ${response.status}`)
+      }
+      return payload
     }
 
     // --- styles -----------------------------------------------------------------
@@ -135,6 +198,18 @@ window.__ModuleLoader__.load({
 .dsh-edit-retry-menuitem:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 .dsh-edit-retry-menuitem:focus-visible { outline: 2px solid var(--dsw-alias-button-primary-fill); outline-offset: -2px; }
 .dsh-edit-retry-menuitem:disabled { cursor: default; opacity: .45; }
+/* The toggle is a separator-delimited third row: it configures the two above it
+   rather than being a third action, and the rule is what says so. */
+.dsh-edit-retry-separator { margin: 4px 6px; border-top: .5px solid var(--dsw-alias-border-l4); }
+.dsh-edit-retry-menutoggle { display: flex; align-items: center; gap: 8px; }
+.dsh-edit-retry-check {
+  flex: none;
+  width: 12px;
+  color: var(--dsw-alias-button-primary-fill);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
 /* Retry feedback: the menu closes on click, so progress and failure have
    to surface under the bubble the way the editor's own row does. */
 .dsh-edit-retry-status { padding: 4px 2px 0; }
@@ -352,7 +427,7 @@ window.__ModuleLoader__.load({
         }),
         error === undefined || error === null
           ? null
-          : h('div', { className: 'dsh-edit-retry-error' }, `${t.failed}${error}`),
+          : h('div', { className: 'dsh-edit-retry-error' }, error),
         h(
           'div',
           { className: 'dsh-edit-retry-row' },
@@ -440,10 +515,16 @@ window.__ModuleLoader__.load({
       function makeShim(shipped, ctx) {
         return function EditRetryUserNode(props) {
           const [editing, setEditing] = useState(false)
-          const [busy, setBusy] = useState(false)
+          // undefined while idle, otherwise the phase: 'retry' | 'delete'.
+          const [busy, setBusy] = useState(undefined)
+          // Carries its own label, so a retry failure and a delete failure read
+          // differently instead of both claiming the retry failed.
           const [error, setError] = useState(undefined)
           // Pointer position of the open context menu, or undefined while closed.
           const [menu, setMenu] = useState(undefined)
+          // Declared last: the four slots above are the ones the self-check scripts
+          // positionally, and this one has a safe default of its own.
+          const [deleteSource, setDeleteSource] = useState(readDeletePref)
           const menuRef = useRef(null)
           const t = copyFor(ctx)
 
@@ -468,18 +549,35 @@ window.__ModuleLoader__.load({
 
           const onSubmit = useCallback(
             (text) => {
-              setBusy(true)
+              // `busy` doubles as the phase: the retry and the delete that may follow
+              // it are one continuous operation, and the status row has to say which
+              // half is running. The failure label needs the same distinction, which
+              // a closure over `busy` cannot give — state read here is the value from
+              // THIS render, so the phase is tracked in a plain local instead.
+              let phase = 'retry'
+              setBusy('retry')
               setError(undefined)
               retryFrom(
                 ctx,
                 { sessionId: props.sessionId, seq: data.seq, cwd: props.cwd, workspaceId },
                 text
               )
-                .then(() => setEditing(false))
-                .catch((failure) => setError(String(failure?.message ?? failure)))
-                .finally(() => setBusy(false))
+                .then(async () => {
+                  setEditing(false)
+                  // Only now: the retry is in flight, so the source is genuinely
+                  // redundant. A failed retry leaves the source untouched.
+                  if (!deleteSource) return
+                  phase = 'delete'
+                  setBusy('delete')
+                  await deleteSourceSession(props.sessionId)
+                })
+                .catch((failure) => {
+                  const message = String(failure?.message ?? failure)
+                  setError(`${phase === 'delete' ? t.deleteFailed : t.failed}${message}`)
+                })
+                .finally(() => setBusy(undefined))
             },
-            [props.sessionId, props.cwd, workspaceId, data.seq]
+            [props.sessionId, props.cwd, workspaceId, data.seq, deleteSource, t]
           )
 
           // Retry: the same path with the text untouched, for when the edit was
@@ -558,8 +656,12 @@ window.__ModuleLoader__.load({
                   'div',
                   { className: 'dsh-edit-retry-status' },
                   busy
-                    ? h('span', { className: 'dsh-edit-retry-hint' }, t.sending)
-                    : h('span', { className: 'dsh-edit-retry-error' }, `${t.failed}${error}`)
+                    ? h(
+                        'span',
+                        { className: 'dsh-edit-retry-hint' },
+                        busy === 'delete' ? t.deleting : t.sending
+                      )
+                    : h('span', { className: 'dsh-edit-retry-error' }, error)
                 )
               : null,
             menu === undefined
@@ -578,7 +680,7 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'dsh-edit-retry-menuitem',
                       role: 'menuitem',
-                      disabled: original.length === 0 || busy,
+                      disabled: original.length === 0 || busy !== undefined,
                       onClick: onRetry
                     },
                     t.retry
@@ -589,13 +691,37 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'dsh-edit-retry-menuitem',
                       role: 'menuitem',
-                      disabled: busy,
+                      disabled: busy !== undefined,
                       onClick: () => {
                         setMenu(undefined)
                         setEditing(true)
                       }
                     },
                     t.action
+                  ),
+                  h('div', { className: 'dsh-edit-retry-separator', role: 'separator' }),
+                  // A toggle, not a third action: it arms the two entries above it.
+                  // Deleting is permanent, so it is opt-in and stays where it was left.
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-edit-retry-menuitem dsh-edit-retry-menutoggle',
+                      role: 'menuitemcheckbox',
+                      'aria-checked': deleteSource,
+                      disabled: busy !== undefined,
+                      onClick: () => {
+                        const next = !deleteSource
+                        setDeleteSource(next)
+                        writeDeletePref(next)
+                      }
+                    },
+                    h(
+                      'span',
+                      { className: 'dsh-edit-retry-check', 'aria-hidden': 'true' },
+                      deleteSource ? '✓' : ''
+                    ),
+                    t.deleteSource
                   )
                 )
           )
