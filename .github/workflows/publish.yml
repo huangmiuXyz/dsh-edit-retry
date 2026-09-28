@@ -1,0 +1,33 @@
+name: publish
+
+# Trusted publishing (OIDC): no npm token and no one-time password is involved.
+# npm authenticates the run through GitHub's OIDC identity, so the only thing
+# that authorizes a publish is this file's name in this repository — which is
+# exactly what `npm trust github dsh-edit-retry --file publish.yml` records.
+#
+# The filename must stay `publish.yml`; renaming it breaks the trust record.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # the OIDC token npm exchanges for publish credentials
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Trusted publishing needs npm >= 11.5.1; Node 24 ships an 11.x but the
+      # floor is stated explicitly so a runner image change cannot silently
+      # drop below it. No registry-url: setup-node would then write an
+      # _authToken placeholder, and token auth takes precedence over OIDC.
+      - run: npm install -g npm@^11.5.1
+      - run: npm --version
+      # The offline self-check is free and runs before anything leaves the runner.
+      - run: node test/check.mjs
+      - run: npm publish --provenance --access public --registry=https://registry.npmjs.org/
