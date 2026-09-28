@@ -202,13 +202,27 @@ window.__ModuleLoader__.load({
    rather than being a third action, and the rule is what says so. */
 .dsh-edit-retry-separator { margin: 4px 6px; border-top: .5px solid var(--dsw-alias-border-l4); }
 .dsh-edit-retry-menutoggle { display: flex; align-items: center; gap: 8px; }
+/* A checkbox, drawn rather than implied. An empty slot reads as nothing at all —
+   the unchecked state has to be a visible box for the row to look like the control
+   it is. Checked fills with the primary colour and takes the on-primary glyph. */
 .dsh-edit-retry-check {
+  display: flex;
   flex: none;
-  width: 12px;
-  color: var(--dsw-alias-button-primary-fill);
-  font-size: 12px;
-  line-height: 18px;
-  text-align: center;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 4px;
+  color: var(--dsw-alias-label-primary-foreground);
+  font-size: 10px;
+  line-height: 1;
+  transition: background-color .12s ease, border-color .12s ease;
+}
+.dsh-edit-retry-check-on {
+  border-color: var(--dsw-alias-button-primary-fill);
+  background: var(--dsw-alias-button-primary-fill);
 }
 /* Retry feedback: the menu closes on click, so progress and failure have
    to surface under the bubble the way the editor's own row does. */
@@ -718,8 +732,13 @@ window.__ModuleLoader__.load({
                     },
                     h(
                       'span',
-                      { className: 'dsh-edit-retry-check', 'aria-hidden': 'true' },
-                      deleteSource ? '✓' : ''
+                      {
+                        className: deleteSource
+                          ? 'dsh-edit-retry-check dsh-edit-retry-check-on'
+                          : 'dsh-edit-retry-check',
+                        'aria-hidden': 'true'
+                      },
+                      deleteSource ? '✓' : null
                     ),
                     t.deleteSource
                   )

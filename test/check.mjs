@@ -323,6 +323,11 @@ check('menu: separates the toggle from the actions', menuItems[2]?.props?.classN
 check('menu: offers the zh delete-source toggle last', menuItems[3]?.children?.[1] === '重试后删除原会话', JSON.stringify(menuItems[3]?.children))
 check('menu: the toggle is a checkbox, not an action', menuItems[3]?.props?.role === 'menuitemcheckbox', String(menuItems[3]?.props?.role))
 check('menu: the toggle starts unchecked', menuItems[3]?.props?.['aria-checked'] === false, String(menuItems[3]?.props?.['aria-checked']))
+// The unchecked state must still be VISIBLE. An empty slot renders as nothing and
+// the row stops reading as a checkbox at all, which is the whole point of the box.
+check('menu: the unchecked toggle draws a box', menuItems[3]?.children?.[0]?.props?.className === 'dsh-edit-retry-check', String(menuItems[3]?.children?.[0]?.props?.className))
+check('menu: the unchecked box is unfilled', !String(menuItems[3]?.children?.[0]?.props?.className).includes('check-on'), String(menuItems[3]?.children?.[0]?.props?.className))
+check('menu: the unchecked box carries no glyph', menuItems[3]?.children?.[0]?.children?.[0] === null, JSON.stringify(menuItems[3]?.children?.[0]?.children))
 stateCalls.length = 0
 menuItems[1]?.props?.onClick?.()
 check('menu: choosing the edit entry enters the editor', stateCalls.includes(true), JSON.stringify(stateCalls))
@@ -337,6 +342,7 @@ const armedTree = shim({ node: userNode(8, [text('你好')]), sessionId: 'sessio
 const armedToggle = resolve(resolve(armedTree.children[2])?.children?.[3])
 check('menu: an armed toggle shows a tick', armedToggle?.props?.['aria-checked'] === true, String(armedToggle?.props?.['aria-checked']))
 check('menu: an armed toggle renders the tick glyph', armedToggle?.children?.[0]?.children?.[0] === '✓', JSON.stringify(armedToggle?.children?.[0]))
+check('menu: the armed box is filled in', armedToggle?.children?.[0]?.props?.className === 'dsh-edit-retry-check dsh-edit-retry-check-on', String(armedToggle?.children?.[0]?.props?.className))
 check('menu: the toggle is operable while idle', armedToggle?.props?.disabled === false, String(armedToggle?.props?.disabled))
 
 // Blank text is not worth resending, so retry disables itself while the
