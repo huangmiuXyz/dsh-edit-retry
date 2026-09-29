@@ -387,6 +387,8 @@ check('menu: stays closed until asked', closedTree.children[2] === null, JSON.st
 const forkCalls = []
 const createCalls = []
 const promptCalls = []
+/** Ordered landmark log: what the retry did to the target, and in which order. */
+const callOrder = []
 /**
  * A faithful COMPLETE event window for one session: an earlier human prompt at
  * seq 8 opens turn 1; a later one at seq 21 opens turn 2.
@@ -404,6 +406,13 @@ let windowEntries = [
   { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } }
 ]
 let windowHasMore = false
+/**
+ * The `modelSelection` projection of each session, keyed by id — the durable
+ * `{ lastUsed, next }` wire view the composer's model control renders. The retry
+ * reads the SOURCE's, and compares the TARGET's before deciding to write a
+ * selection of its own.
+ */
+let selectionsById = {}
 const sessions = {
   fork: (options) => {
     forkCalls.push(options)
@@ -413,9 +422,16 @@ const sessions = {
     createCalls.push(options ?? {})
     return Promise.resolve('session-fresh')
   },
-  binding: () => ({
+  binding: (id) => ({
     eventSource: {
       getSnapshot: () => ({ entries: windowEntries, hasMore: windowHasMore, revision: 1, change: { kind: 'append', entries: [] } })
+    },
+    session: {
+      projections: {
+        // `faceOf` answers for EVERY key and reports absence as an undefined
+        // snapshot — never as a missing face.
+        faceOf: (key) => ({ getSnapshot: () => (key === 'modelSelection' ? selectionsById[id] : undefined) })
+      }
     }
   }),
   using: async (target, options, operation) =>
@@ -427,6 +443,7 @@ const sessions = {
         session: {
           prompt: async (content, mode) => {
             promptCalls.push({ target, content, mode })
+            callOrder.push('prompt')
           }
         }
       }
@@ -560,7 +577,129 @@ check('retry: the first prompt still creates', createCalls.length === 1 && forkC
 check('retry: the fresh session mirrors the Workspace', createCalls[0]?.workspaceId === 'ws-1', JSON.stringify(createCalls[0]))
 check('retry: the fresh session resends the original text', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
 
-// --- 5c. the delete-the-source half -------------------------------------------
+// --- 5c. the model the retry runs on -------------------------------------------
+// A fork inherits only the source's event PREFIX, and a Host resolves a session's
+// model from that session's OWN log, so a selection the user made after the
+// retried message never reaches the child. The retry therefore reads what the
+// source is showing and pins it on the target BEFORE the prompt.
+const selectCalls = []
+let selectReply = { ok: true, value: { selected: { provider: 'picked', model: 'big-model', reasoningEffort: 'high' } } }
+const modelRemote = {
+  selectModel: async (request) => {
+    selectCalls.push(request)
+    callOrder.push('select')
+    return selectReply
+  }
+}
+const { slots: modelSlots } = runApply('lowest', 'chat', {
+  sessions,
+  uiWorkspace: { openSession: async () => {} },
+  'remote.session': modelRemote
+})
+const modelShim = modelSlots.__entries.find((e) => e.component !== fakeShipped).component
+
+/** Drive `modelShim`'s retry entry for one source/target selection pair. */
+async function retryWith(seq, source, target, value = '第二句') {
+  selectionsById = { 'session-1': source, 'session-child': target, 'session-fresh': target }
+  selectCalls.length = 0
+  promptCalls.length = 0
+  forkCalls.length = 0
+  createCalls.length = 0
+  callOrder.length = 0
+  useStateScript = [false, undefined, undefined, { left: 10, top: 20 }]
+  const host = modelShim({ node: userNode(seq, [text(value)]), sessionId: 'session-1', cwd: PKG, t: fakeT, useWorkspaces })
+  const items = (resolve(host?.children?.[2])?.children ?? []).map((child) => resolve(child))
+  items[0]?.props?.onClick?.()
+  await new Promise((done) => setTimeout(done, 0))
+}
+
+// The user switched models and then retried an older message. The prefix resolves
+// to the OLD route; the retry must run on the one they are looking at.
+const later = [
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'turn/end', seq: 19 } },
+  { type: 'event', event: { type: 'turn/start', seq: 20 } },
+  { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } }
+]
+windowEntries = later
+await retryWith(21, { lastUsed: { provider: 'old', model: 'old-model' }, next: { provider: 'picked', model: 'big-model', reasoningEffort: 'high' } }, { lastUsed: { provider: 'old', model: 'old-model' }, next: { provider: 'old', model: 'old-model' } })
+check(
+  'model: the retry adopts the route the source shows, not the inherited one',
+  selectCalls[0]?.sessionId === 'session-child' && selectCalls[0]?.provider === 'picked' && selectCalls[0]?.model === 'big-model' && selectCalls[0]?.reasoningEffort === 'high',
+  JSON.stringify(selectCalls[0])
+)
+check('model: the selection lands BEFORE the prompt', callOrder.join(',') === 'select,prompt', callOrder.join(','))
+check('model: the retry still sends the text', promptCalls.length === 1, JSON.stringify(promptCalls.length))
+
+// The fresh-session path has no prefix to inherit from, so the source's selection
+// has to be pinned there too — a new session would otherwise resolve to whatever
+// the deployment default happens to be.
+windowEntries = [
+  { type: 'event', event: { type: 'turn/start', seq: 4 } },
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } }
+]
+await retryWith(8, { next: { provider: 'picked', model: 'big-model' } }, undefined, '第一句')
+check('model: a fresh retry session is pinned as well', selectCalls[0]?.sessionId === 'session-fresh' && selectCalls[0]?.provider === 'picked', JSON.stringify(selectCalls[0]))
+check('model: the fresh session still gets its prompt', promptCalls[0]?.content?.[0]?.text === '第一句', JSON.stringify(promptCalls[0]))
+windowEntries = later
+
+// `next` is the pending intent, `lastUsed` only its fallback — a session whose
+// user just picked a model reports it in `next`, and that is the one to copy.
+await retryWith(21, { lastUsed: { provider: 'used', model: 'used' }, next: null }, { lastUsed: { provider: 'old', model: 'old' }, next: { provider: 'old', model: 'old' } })
+check('model: a null `next` falls back to the last used route', selectCalls[0]?.provider === 'used' && selectCalls[0]?.model === 'used', JSON.stringify(selectCalls[0]))
+
+// Nothing to carry: a session that never selected keeps its own resolution.
+await retryWith(21, { lastUsed: null, next: null }, { lastUsed: { provider: 'old', model: 'old' }, next: { provider: 'old', model: 'old' } })
+check('model: an unselected source selects nothing', selectCalls.length === 0, JSON.stringify(selectCalls))
+
+// A target that already resolves to the same route is left alone: no redundant
+// durable event, and no needless re-save of the deployment default.
+await retryWith(21, { lastUsed: null, next: { provider: 'same', model: 'same', reasoningEffort: 'max' } }, { lastUsed: null, next: { provider: 'same', model: 'same', reasoningEffort: 'max' } })
+check('model: an already-matching target is not re-selected', selectCalls.length === 0, JSON.stringify(selectCalls))
+check('model: the prompt still goes out after a skip', promptCalls.length === 1, JSON.stringify(promptCalls.length))
+
+// Every effort field is optional on the wire; a route without one must not gain
+// a fabricated effort (`undefined` is not the same as `off`).
+await retryWith(21, { next: { provider: 'p', model: 'm' } }, { next: { provider: 'old', model: 'old' } })
+check('model: an absent effort is not invented', selectCalls[0] !== undefined && !('reasoningEffort' in selectCalls[0]), JSON.stringify(selectCalls[0]))
+
+// A refused selection (route withdrawn, session held by another writer) is the
+// Host saying no to the ADD-ON: the retry itself must still be sent.
+selectReply = { ok: false, error: { code: 'session/model-unavailable', message: 'no adapter serves this route' } }
+await retryWith(21, { next: { provider: 'gone', model: 'gone' } }, { next: { provider: 'old', model: 'old' } })
+check('model: a refused selection does not fail the retry', promptCalls.length === 1, JSON.stringify({ promptCalls, selectCalls }))
+
+const selectionWarnings = []
+const realWarn = console.warn
+console.warn = (...args) => selectionWarnings.push(args.join(' '))
+try {
+  selectReply = { ok: true }
+  modelRemote.selectModel = async () => { throw new Error('transport exploded') }
+  await retryWith(21, { next: { provider: 'p', model: 'm' } }, { next: { provider: 'old', model: 'old' } })
+} finally {
+  modelRemote.selectModel = async (request) => { selectCalls.push(request); callOrder.push('select'); return selectReply }
+  console.warn = realWarn
+}
+check('model: a throwing selection does not fail the retry', promptCalls.length === 1, JSON.stringify(promptCalls.length))
+check('model: a swallowed failure is reported', selectionWarnings.some((line) => line.includes('inherited model') && line.includes('transport exploded')), selectionWarnings.join(' | ') || '(no warning)')
+
+// The carry-over is an ADD-ON: a profile with no session Remote namespace keeps
+// the menu and the retry, and only loses the model hand-off.
+const { slots: noRemoteSlots } = runApply('lowest', 'chat', {
+  sessions,
+  uiWorkspace: { openSession: async () => {} }
+})
+const noRemoteShim = noRemoteSlots.__entries.find((e) => e.component !== fakeShipped).component
+selectionsById = { 'session-1': { next: { provider: 'picked', model: 'big' } }, 'session-child': { next: { provider: 'old', model: 'old' } } }
+selectCalls.length = 0
+promptCalls.length = 0
+useStateScript = [false, undefined, undefined, { left: 10, top: 20 }]
+const noRemoteHost = noRemoteShim({ node: userNode(21, [text('第二句')]), sessionId: 'session-1', cwd: PKG, t: fakeT, useWorkspaces })
+resolve(resolve(noRemoteHost?.children?.[2])?.children?.[0])?.props?.onClick?.()
+await new Promise((done) => setTimeout(done, 0))
+check('model: without the Remote namespace the retry still runs', promptCalls.length === 1 && selectCalls.length === 0, JSON.stringify({ promptCalls: promptCalls.length, selectCalls: selectCalls.length }))
+
+// --- 5d. the delete-the-source half -------------------------------------------
 // Client and host are separate module graphs with no shared import, so the route
 // and header are spelled twice. Assert the two spellings agree, or the feature
 // would silently 404 forever.
@@ -623,7 +762,7 @@ await submitVia(21, '改过的', PKG, 'ws-1', true)
 check('delete: a rejected delete surfaces the host error', stateCalls.some((call) => typeof call === 'string' && call.startsWith('删除原会话失败：') && call.includes('session log could not be removed')), JSON.stringify(stateCalls))
 fetchReply = { ok: true, status: 200, payload: { ok: true } }
 
-// --- 5d. host half: the delete itself ------------------------------------------
+// --- 5e. host half: the delete itself ------------------------------------------
 // The host half is driven for real: a temporary DSH_HOME holds actual session
 // directories, so the filesystem behaviour under test is the real one.
 const SESSION = '11111111-2222-3333-4444-555555555555'

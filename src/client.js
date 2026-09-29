@@ -26,6 +26,16 @@
 //   a silent divergence. Forking is exactly the path the shipped "branch"
 //   button uses, so behaviour and permissions match the product.
 //
+// Which model the retry runs on:
+//   A fork inherits only the source's EVENT PREFIX up to the retry point, and a
+//   Host resolves a session's model from that session's own log (a pending
+//   `model/selection`, else the route of its last `request/header`, else the
+//   deployment default). So a child forked at an older message used to run on
+//   the model of THAT TURN, silently ignoring a switch the user made later —
+//   the usual case, since one switches models and then retries something above.
+//   The retry therefore reads the source's current selection (exactly what the
+//   composer shows) and pins it on the child before its first prompt.
+//
 // How the bubble is wrapped without copying it:
 //   The shipped `conversation.chat.node` entry for key "user" sits at the default
 //   priority 0. This profile-installed Client half registers the SAME key at
@@ -365,6 +375,10 @@ window.__ModuleLoader__.load({
      *   "用时 N 秒" row; cutting in front of Turn 1 inherits the inbox splice that
      *   still HOLDS the original prompt but not the later splice that claimed it,
      *   so the child re-sends the original text before the edited one.
+     *
+     * Either shape then runs on the model the SOURCE was showing (see
+     * {@link sessionSelection}): the prefix a fork inherits carries the route of
+     * that older turn, not the one the user has selected now.
      * @returns the retry session id.
      */
     async function retryFrom(ctx, { sessionId, seq, cwd, workspaceId }, text) {
@@ -372,6 +386,10 @@ window.__ModuleLoader__.load({
       const workspace = ctx.get('uiWorkspace')
       if (sessions === undefined) throw new Error('sessions service unavailable')
       if (workspace === undefined) throw new Error('uiWorkspace service unavailable')
+
+      // Read BEFORE forking: this is the model the source was showing when the user
+      // chose to retry, and no prefix of the source's log necessarily contains it.
+      const selection = sessionSelection(ctx, sessionId)
 
       let targetId
       if (isFirstHumanPrompt(ctx, sessionId, seq)) {
@@ -395,10 +413,128 @@ window.__ModuleLoader__.load({
 
       await sessions.using(targetId, { source: SOURCE }, async (reference) => {
         await reference.ready
+        // Carry the model over BEFORE the prompt: the Host installs a selection for
+        // the next request assembly, so a selection that lands after it would apply
+        // to the turn after this one. A refusal (route gone, session held by another
+        // writer) is reported and swallowed — the retry itself still has to happen.
+        try {
+          await pinSelection(ctx, targetId, selection)
+        } catch (error) {
+          console.warn(`[edit-retry] retry runs on the inherited model: ${String(error?.message ?? error)}`)
+        }
         await reference.binding.session.prompt([{ type: 'text', text }], 'queue')
       })
 
       return targetId
+    }
+
+    // --- the model the retry runs on ---------------------------------------------
+    /**
+     * A wire selection, or undefined when it names no provider and model.
+     *
+     * The `modelSelection` projection's wire view is `{ lastUsed, next }`, and both
+     * halves carry the same `{ provider, model, reasoningEffort? }` shape the
+     * selection RPC takes. Anything else is a shape this plugin does not know, and
+     * guessing at it would be worse than not carrying the model over.
+     */
+    function normalizeSelection(value) {
+      if (value === null || typeof value !== 'object') return undefined
+      if (typeof value.provider !== 'string' || value.provider.length === 0) return undefined
+      if (typeof value.model !== 'string' || value.model.length === 0) return undefined
+      return {
+        provider: value.provider,
+        model: value.model,
+        ...(typeof value.reasoningEffort === 'string' && value.reasoningEffort.length > 0
+          ? { reasoningEffort: value.reasoningEffort }
+          : {})
+      }
+    }
+
+    /** Whether two selections name the same route AND the same reasoning effort. */
+    function sameSelection(left, right) {
+      if (left === undefined || right === undefined) return false
+      return (
+        left.provider === right.provider &&
+        left.model === right.model &&
+        left.reasoningEffort === right.reasoningEffort
+      )
+    }
+
+    /**
+     * The model selection a session is currently showing.
+     *
+     * This is the `modelSelection` projection's `next` — a pending intent if there
+     * is one, otherwise the route of the session's last request — which is exactly
+     * what the composer's model control renders. Read it through the binding rather
+     * than the Host: it is the same durable frame the UI already displays, so the
+     * retry cannot disagree with what the user saw when they clicked.
+     * @returns `{ provider, model, reasoningEffort? }`, or undefined for a session
+     *   that never selected (or whose projections are not loaded).
+     */
+    function sessionSelection(ctx, sessionId) {
+      let value
+      try {
+        const sessions = ctx.get('sessions')
+        value = sessions?.binding?.(sessionId)?.session?.projections?.faceOf?.('modelSelection')?.getSnapshot?.()
+      } catch {
+        return undefined
+      }
+      return normalizeSelection(value?.next ?? value?.lastUsed)
+    }
+
+    /**
+     * Reach the Host's `session/selectModel` — the RPC the shipped composer model
+     * control submits through.
+     *
+     * Probed, not declared: carrying the model over is an ADD-ON to the retry, so a
+     * profile that mounts no session Remote namespace must lose only the carry-over,
+     * never the menu. (`ctx.remote.session` is the namespace service; `ctx.remote`
+     * is the parent, checked as the second spelling of the same thing.)
+     */
+    function modelRemote(ctx) {
+      for (const read of [() => ctx.get('remote.session'), () => ctx.get('remote')?.session]) {
+        try {
+          const remote = read()
+          if (remote !== null && remote !== undefined && typeof remote.selectModel === 'function') return remote
+        } catch {
+          /* no such service in this profile */
+        }
+      }
+      return undefined
+    }
+
+    /**
+     * Pin `selection` on a session about to be prompted.
+     *
+     * `selectModel` installs the choice for the NEXT request assembly, so it has to
+     * land before `prompt` — the same ordering the shipped picker relies on. The
+     * Host records it as a durable `model/selection` event, which is what makes the
+     * child's own transcript and model control agree with the model that ran.
+     *
+     * Skipped when the session already resolves to the same route: a single-model
+     * retry then writes no event at all.
+     * @returns true when the Host accepted the selection.
+     */
+    async function pinSelection(ctx, sessionId, selection) {
+      if (selection === undefined) return false
+      const remote = modelRemote(ctx)
+      if (remote === undefined) return false
+      // Compared against the TARGET, so a retry that already inherits the right
+      // route stays untouched. An unreadable target compares as different — the
+      // Host then validates a selection that is already true, which is harmless.
+      if (sameSelection(selection, sessionSelection(ctx, sessionId))) return false
+      const result = await remote.selectModel({
+        sessionId,
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort })
+      })
+      // Remote calls answer with an envelope instead of throwing, and the shipped
+      // caller treats a non-`ok` answer as a failure.
+      if (result === null || result === undefined || result.ok !== true) {
+        throw new Error(result?.error?.message ?? result?.error?.code ?? 'the model selection was refused')
+      }
+      return true
     }
 
     // --- components -------------------------------------------------------------
