@@ -18,7 +18,7 @@
 
 编辑器里回车换行、`⌘/Ctrl + Enter` 保存、`Esc` 取消。两条动作的后续完全一样：
 
-1. 从这条消息**之前**的那个事件分叉出新会话；
+1. 从这条消息**之前**的那个**已闭合的 turn** 分叉出新会话（见下面的「为什么重试前面不会多一行」）；
 2. 打开这个新会话；
 3. 把源会话**当前选中的模型**装到新会话上（见下一节），再把文本（原文或改后的）作为提示词发进去；
 4. 如果开关是勾上的，**最后**删掉源会话。
@@ -26,6 +26,17 @@
 整个过程复用的是 DSH 自带「分支」按钮的同一条路径，所以权限和行为跟原生功能一致。
 
 选择后菜单就关闭了，因此进度和失败会显示在气泡下方（「正在重试…」/「正在删除原会话…」/「重试失败：原因」/「删除原会话失败：原因」）—— 编辑那条路径则复用编辑器自己的提示行。
+
+## 为什么重试前面不会多一行「用时 N 秒」
+
+分叉点默认是「这条消息的前一个事件」（`seq - 1`），而它**必然落在消息自己那个 turn 内部**：DSH 先 `turn/start`、再把提示词 splice 进 inbox，最后才写下转录用来挂气泡的 `user/message`。切在半个 turn 上，DSH 的 `buildForkSeed` 就会用 `openTurnClosers` 补一条合成的 `step/end` + `turn/end {kind:"forked"}` —— 背后没有任何用户消息，转录把它渲染成重试内容**前面**的一行空「用时 N 秒」（实测跨度十几毫秒，取整显示成 1 秒）。
+
+所以插件把分叉点改到**上一个 turn 的 `turn/end`**（一个平衡边界，`openTurnClosers` 扫完发现没有开着的 turn，就不补任何东西），前提是这条消息**开了它自己的 turn**，并且满足下面几条：
+
+- **消息是该 turn 的第一条** → 切到上一个 `turn/end`。它同时也在这条提示词的 inbox splice **之前**，所以子会话不会重发原文（跟第一条消息改走「新建会话」是同一个理由）。
+- **上一个 turn 结束时 inbox 里还压着没被取走的提示词** → 保持 `seq - 1`。被用户中断（`aborted`）的 turn 会把已 splice 进 inbox 的提示词留在队列里，等下一个 turn 才取走；切到那个 `turn/end` 会把这条**源会话从没回答过**的文本一起继承给子会话，让它先重发一遍。所以分叉前先数一遍 inbox 的净存量（Σ`inserted` − Σ`removedCount`），非空就不切。
+- **消息是 turn 中途插进去的**（steering）→ 保持 `seq - 1`。它前面没有任何已闭合边界，往前切会连带丢掉同一 turn 里更早的消息，那比多一行严重。
+- **事件窗口还没加载完**（`hasMore`）→ 同样保持 `seq - 1`：看不到开头就既不能断言「这是第一条」，也不能信一个自己看不见起点的边界。
 
 ## 重试跑在哪个模型上
 
@@ -122,7 +133,7 @@ bundle 登记同上 —— `dsh plugin` 会自动做，手动做法见上面的�
 - **只处理纯文本消息。** 带附件的消息没法当文本重发，因此保留浏览器原生右键菜单。
 - **消息内的交互元素**（链接、按钮、输入框）保留它们自己的右键菜单，插件不会抢占。
 - **消息为空白时「重试」置灰** —— 重发一个空提示词没有意义；「编辑并重试」仍然可用，它也是给这种消息补上文本的唯一途径。
-- **第一条消息**走「新建会话」而不是「分叉」。理由见下面的注释；简单说，在 Turn 1 内部切分会留下一个空的「用时 N 秒」行，而在 Turn 1 之前切分会让子会话重发原文。第一条之外的消息才做分叉。
+- **第一条消息**走「新建会话」而不是「分叉」。理由见下面的注释；简单说，在 Turn 1 内部切分会留下一个空的「用时 N 秒」行，而在 Turn 1 之前切分会让子会话重发原文。第一条之外的消息才做分叉，并且切到**上一个已闭合的 turn 末尾**（中途插话的消息、以及上一个 turn 结束时 inbox 里还压着未取走提示词的情况除外，见上文）。
 - **两条菜单项共用同一套分叉规则** —— 是消息的位置决定走新建还是分叉，跟选了哪一项无关。
 - **重试跑在源会话当前选中的模型上**，而不是被重试那条消息当时用的模型；路由不可用时退回前缀继承的那个，重试本身不受影响。
 - **重试会话会落在和源会话相同的 Workspace 分组里**，不会掉进 Ungrouped。
@@ -168,7 +179,7 @@ A DSH plugin with both halves.
 - **Install:** `dsh plugin --profile <profile> add github:huangmiuXyz/dsh-edit-retry`, then restart DSH. The CLI forwards to pnpm in the profile directory and registers the bundle entry for you. The bare name does not resolve yet — the package is not on npm — and the Desktop app's own profile (`--profile desktop`) refuses the CLI, so install it there through the in-app plugin manager instead.
 - **Two entries:** *Retry* resends the text untouched; *Edit and retry* opens an editor first. Both share one fork rule and one resend path, so only the text differs. Because the menu closes on click, the operation reports progress and failure in a status line under the bubble.
 - **Deleting the source is opt-in and permanent.** DSH gives client plugins no way to delete a session — the workspace surface only archives, and the session store has no public remove API — so the delete lives in the **host half** and is reached over an HTTP route the host registers. It force-stops the agent, flushes, detaches the live entry, removes the on-disk log in both id spellings, *confirms it is gone*, and only then clears the workspace and projection accounting, because a half-deleted session is worse than an undeleted one. It runs only after the retry actually got in flight: a failed retry leaves the source alone. The route requires a custom header, which is what forces a CORS preflight and keeps other pages out, and session ids are charset-validated and path-containment-checked before touching the filesystem.
-- **Boundaries:** text-only messages are retryable (attachments keep the native menu); right-click is the only entry point; interactive descendants keep their own context menu; blank text disables *Retry* while *Edit and retry* stays available; the first human prompt opens a fresh session while later prompts fork; the retry adopts the source's currently selected model and falls back to the inherited one if that route is unavailable.
+- **Boundaries:** text-only messages are retryable (attachments keep the native menu); right-click is the only entry point; interactive descendants keep their own context menu; blank text disables *Retry* while *Edit and retry* stays available; the first human prompt opens a fresh session while later prompts fork at the previous turn's **closed** boundary — a message injected mid-turn keeps its predecessor, because cutting earlier would drop messages the caller can still see; the retry adopts the source's currently selected model and falls back to the inherited one if that route is unavailable.
 - **Caveat:** the delete walks into DSH internals (`sessions.store` / `detachEntered` / `storageDomain` shapes / the on-disk layout). Every step is feature-probed, so an upgrade degrades this to a refused or partial delete rather than a crash — but it can break. Also, the sidebar row for a deleted session may linger until the next reload; DSH exposes no client-side refresh, and reloading the page would interrupt the retry that was just sent.
 - **How:** the plugin shadows the shipped `user` chat node at priority `-1` and renders the shipped component through `ctx.slots.entries()`, forwarding its `locale` seat so the shipped bubble keeps its `t`. The client half imports nothing but React.
 - **Test:** `node test/check.mjs` — dependency-free offline self-check. The delete half runs against a real temporary `DSH_HOME`, so the filesystem behaviour under test is the real one.

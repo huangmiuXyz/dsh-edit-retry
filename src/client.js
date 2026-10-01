@@ -342,23 +342,103 @@ window.__ModuleLoader__.load({
 
     // --- the retry itself -------------------------------------------------------
     /**
-     * Whether this message is the session's first human prompt.
+     * The session's loaded event window, oldest first.
      *
      * Conclusive only on a COMPLETE window: with older history still unloaded an
-     * earlier prompt may simply be outside it, and answering "first" there would
-     * throw away history the caller can still see.
-     * @returns true when no earlier human prompt exists and none is unloaded.
+     * earlier prompt may simply be outside it, and both callers below would then
+     * answer from a prefix that is not the session's start.
+     * @returns the window's events, or undefined when it proves nothing.
      */
-    function isFirstHumanPrompt(ctx, sessionId, seq) {
+    function completeWindow(ctx, sessionId) {
       const window = ctx.get('sessions')?.binding(sessionId)?.eventSource?.getSnapshot()
-      if (window === undefined || window.hasMore) return false
-      for (const entry of window.entries) {
-        if (entry.type !== 'event') continue
-        const event = entry.event
+      if (window === undefined || window.hasMore) return undefined
+      return window.entries.filter((entry) => entry?.type === 'event').map((entry) => entry.event)
+    }
+
+    /**
+     * Whether this message is the session's first human prompt.
+     * @returns true when no earlier human prompt exists in the window.
+     */
+    function isFirstHumanPrompt(events, seq) {
+      for (const event of events) {
         if (event.type !== 'user/message' || event.seq >= seq) continue
         if (event.data?.source?.kind === 'user') return false
       }
       return true
+    }
+
+    /** The seq of the `turn/start` this message belongs to, or -1 when unknown. */
+    function turnStartOf(events, seq) {
+      let turnStart = -1
+      for (const event of events) {
+        if (event.type === 'turn/start' && event.seq <= seq && event.seq > turnStart) turnStart = event.seq
+      }
+      return turnStart
+    }
+
+    /**
+     * How many prompts sit UNCLAIMED in the inbox at `boundary`.
+     *
+     * Net count over the splice events: each splice inserts `inserted` at `start`
+     * and removes `removedCount` from it, and the inbox is only ever drained by a
+     * later splice. A positive total means the prefix still HOLDS prompts that the
+     * source session had not yet consumed.
+     */
+    function inboxPendingAt(events, boundary) {
+      let pending = 0
+      for (const event of events) {
+        if (event.seq === undefined || event.seq > boundary) continue
+        if (event.type !== 'agent/inbox/spliced') continue
+        pending += (event.data?.inserted?.length ?? 0) - (event.data?.removedCount ?? 0)
+      }
+      return pending
+    }
+
+    /**
+     * The seq to fork at, chosen so the inherited prefix ends on a CLOSED turn.
+     *
+     * `seq - 1` is the event immediately before the message, and it is always
+     * INSIDE the message's own turn: DSH opens the turn and splices the prompt into
+     * the inbox before it records the `user/message` the transcript anchors the
+     * bubble to. `buildForkSeed` then has a half-open turn on its hands and appends
+     * `openTurnClosers` — a synthetic `step/end` + `turn/end {kind:"forked"}` with
+     * no user message behind it, which the transcript renders as an empty
+     * "用时 N 秒" row in front of the retry.
+     *
+     * A message that OPENS its turn can do better: the previous turn's `turn/end`
+     * is a balanced boundary, so the closers find nothing open and add nothing. It
+     * also sits BEFORE the inbox splice that carried this prompt, which is what
+     * keeps the child from re-sending the original text — the same hazard that
+     * sends the FIRST prompt down the fresh-session path.
+     *
+     * That boundary only works when the prefix is otherwise DRAINED. A turn the
+     * user aborted can leave a prompt spliced into the inbox and never claimed
+     * (observed: the prompt sits in the queue, the turn ends `aborted`, and the
+     * next turn drains it); forking there inherits it, so the child would re-send
+     * text the source never answered. A non-empty inbox therefore disqualifies the
+     * boundary.
+     *
+     * A steering message, injected mid-turn, has no such boundary at all: every
+     * event before it belongs to its own turn, so cutting earlier would drop
+     * messages the caller can still see. It keeps `seq - 1` and the empty row.
+     * @returns the inclusive boundary seq, or `seq - 1` when nothing better holds.
+     */
+    function forkBoundary(events, seq) {
+      const fallback = seq - 1
+      if (events === undefined) return fallback
+      const turnStart = turnStartOf(events, seq)
+      if (turnStart < 0) return fallback
+      for (const event of events) {
+        if (event.type !== 'user/message' || event.seq >= seq || event.seq <= turnStart) continue
+        if (event.data?.source?.kind === 'user') return fallback
+      }
+      let boundary
+      for (const event of events) {
+        if (event.type !== 'turn/end' || event.seq >= turnStart) continue
+        if (boundary === undefined || event.seq > boundary) boundary = event.seq
+      }
+      if (boundary === undefined) return fallback
+      return inboxPendingAt(events, boundary) > 0 ? fallback : boundary
     }
 
     /**
@@ -366,9 +446,12 @@ window.__ModuleLoader__.load({
      *
      * Two shapes, because the first prompt has no history worth inheriting:
      *
-     * - Later prompts FORK at the event immediately before the message. That prefix
-     *   ends after the Turn opened, so the agent inbox has already claimed its
-     *   message and the child inherits a drained inbox.
+     * - Later prompts FORK at a CLOSED-turn boundary (see {@link forkBoundary}):
+     *   either the previous turn's `turn/end`, which is balanced, or `seq - 1`
+     *   when that boundary is unusable — a steering message injected mid-turn, or
+     *   a prefix whose inbox still holds a prompt the source never claimed. The
+     *   prefix then ends after the inbox splice that claimed the inherited prompt,
+     *   so the child starts with a drained inbox.
      * - The FIRST prompt instead opens a FRESH session. Forking it cannot win:
      *   cutting inside Turn 1 leaves the Host to balance it with synthetic
      *   `step/end` + `turn/end`, which the transcript renders as an empty
@@ -392,14 +475,18 @@ window.__ModuleLoader__.load({
       const selection = sessionSelection(ctx, sessionId)
 
       let targetId
-      if (isFirstHumanPrompt(ctx, sessionId, seq)) {
+      // One window read answers both questions below, and an unprovable window
+      // (still paging) answers neither: it can neither call this message the first
+      // prompt nor trust a boundary it cannot see the start of.
+      const events = completeWindow(ctx, sessionId)
+      if (events !== undefined && isFirstHumanPrompt(events, seq)) {
         // Mirror where the SOURCE session lives, so the retry lands in the same
         // sidebar group instead of Ungrouped. `session.create` accepts workspaceId
         // or cwd and never both, and ONLY a workspaceId attaches the session to a
         // workspace — a bare cwd leaves it unaccounted.
         targetId = await sessions.create(workspaceId === undefined ? { cwd } : { workspaceId })
       } else {
-        const atSeq = seq - 1
+        const atSeq = forkBoundary(events, seq)
         targetId = await sessions.fork({
           sessionId,
           // A message at seq 0 has no predecessor; let the Host pick its own

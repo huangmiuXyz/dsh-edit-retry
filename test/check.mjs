@@ -7,7 +7,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 /** Repo root, resolved from this file so the check runs from any checkout. */
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -517,16 +517,53 @@ createCalls.length = 0
 await submitVia(8, '第一句', PKG, undefined)
 check('submit: an Ungrouped source creates with cwd only', createCalls[0]?.workspaceId === undefined && createCalls[0]?.cwd === PKG, JSON.stringify(createCalls[0]))
 
-// A later prompt forks at the event immediately before the message, so the child
-// inherits the already-drained inbox and cannot re-send anything.
+// A later prompt forks at the previous turn's CLOSED boundary — `turn/end` at 19,
+// not the message's predecessor at 20. Cutting at 20 lands inside the open turn,
+// and `buildForkSeed`'s `openTurnClosers` then synthesizes a `step/end` +
+// `turn/end {kind:"forked"}` with no user message behind it, which the transcript
+// renders as an empty "用时 N 秒" row in front of the retry. It still sits after
+// the inbox splice that claimed turn 1's prompt, so nothing is re-sent.
 forkCalls.length = 0
 createCalls.length = 0
 promptCalls.length = 0
 await submitVia(21, '第二句')
 check('submit: later prompt forks instead of creating', forkCalls.length === 1 && createCalls.length === 0, JSON.stringify({ forkCalls, createCalls }))
 check('submit: forks the source session', forkCalls[0]?.sessionId === 'session-1', JSON.stringify(forkCalls[0]))
-check('submit: forks at the message predecessor', forkCalls[0]?.atSeq === 20, String(forkCalls[0]?.atSeq))
+check('submit: forks at the previous closed turn', forkCalls[0]?.atSeq === 19, String(forkCalls[0]?.atSeq))
 check('submit: bumps the inherited title', forkCalls[0]?.increaseTitle === true, String(forkCalls[0]?.increaseTitle))
+
+// A steering message injected MID-turn has no closed boundary before it: every
+// earlier event belongs to its own turn, so cutting at the previous `turn/end`
+// would drop messages the caller can still see. It keeps the predecessor — and
+// with it the synthesized closing row, which is the lesser cost.
+windowEntries = [
+  { type: 'event', event: { type: 'turn/start', seq: 20 } },
+  { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'user/message', seq: 22, data: { source: { kind: 'user' } } } }
+]
+forkCalls.length = 0
+await submitVia(22, '插话')
+check('submit: a mid-turn steering message keeps the predecessor', forkCalls[0]?.atSeq === 21, String(forkCalls[0]?.atSeq))
+
+// An aborted turn can leave a prompt spliced into the inbox and never claimed —
+// observed in a real log, where seq 212 spliced a prompt, the turn ended
+// `aborted` at 215, and only the NEXT turn drained it at 219. The previous
+// `turn/end` is still a closed boundary, but forking there would inherit that
+// unclaimed prompt, so the child would re-send text the source never answered.
+// A non-empty inbox therefore disqualifies the boundary and the predecessor
+// stands. (Net count: inserted 1 - removed 0.)
+windowEntries = [
+  { type: 'event', event: { type: 'user/message', seq: 8, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'turn/start', seq: 20 } },
+  { type: 'event', event: { type: 'user/message', seq: 21, data: { source: { kind: 'user' } } } },
+  { type: 'event', event: { type: 'agent/inbox/spliced', seq: 25, data: { target: 'next-turn', start: 0, inserted: [{ content: [{ text: '滞留' }] }], removedCount: 0 } } },
+  { type: 'event', event: { type: 'turn/end', seq: 30, data: { reason: { kind: 'aborted' } } } },
+  { type: 'event', event: { type: 'turn/start', seq: 31 } },
+  { type: 'event', event: { type: 'user/message', seq: 32, data: { source: { kind: 'user' } } } }
+]
+forkCalls.length = 0
+await submitVia(32, '接着问')
+check('submit: an unclaimed inbox prompt disqualifies the closed turn', forkCalls[0]?.atSeq === 31, String(forkCalls[0]?.atSeq))
 
 // An incomplete window cannot prove "first": an earlier prompt may just be
 // unloaded, so history the caller can still see must not be discarded.
@@ -559,7 +596,7 @@ opened.length = 0
 await retryVia(21, '第二句', PKG, 'ws-1')
 check('retry: forks without an editor round-trip', forkCalls.length === 1, JSON.stringify({ forkCalls, createCalls }))
 check('retry: never falls back to a fresh session', createCalls.length === 0, JSON.stringify(createCalls))
-check('retry: forks at the message predecessor', forkCalls[0]?.atSeq === 20, String(forkCalls[0]?.atSeq))
+check('retry: forks at the previous closed turn', forkCalls[0]?.atSeq === 19, String(forkCalls[0]?.atSeq))
 check('retry: resends the original text unchanged', promptCalls[0]?.content?.[0]?.text === '第二句', JSON.stringify(promptCalls[0]))
 check('retry: opens the retry session', opened[0] === 'session-child', String(opened[0]))
 
@@ -703,7 +740,9 @@ check('model: without the Remote namespace the retry still runs', promptCalls.le
 // Client and host are separate module graphs with no shared import, so the route
 // and header are spelled twice. Assert the two spellings agree, or the feature
 // would silently 404 forever.
-const host = await import(path.join(PKG, 'src', 'index.js'))
+// `import()` needs a URL, not a path: a Windows absolute path (`E:\...`) is read
+// as the scheme `e:` and rejected with ERR_UNSUPPORTED_ESM_URL_SCHEME.
+const host = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 check('delete: the client and host agree on the route', ownClientSource().includes(`'${host.ROUTE}'`), host.ROUTE)
 check('delete: the client and host agree on the header', ownClientSource().includes(`'${host.HEADER}'`), host.HEADER)
 
