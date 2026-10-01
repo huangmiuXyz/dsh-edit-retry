@@ -120,6 +120,16 @@ function userNode(seq, content) {
 }
 const text = (value) => ({ type: 'text', text: value })
 const image = (data) => ({ type: 'image', mediaType: 'image/png', data })
+/** An image part as a DURABLE message holds it: a reference, not inline bytes. */
+const imageRef = (attachmentId) => ({
+  type: 'image',
+  attachment: { attachmentId, mediaType: 'image/png', bytes: 3, width: 1, height: 1 }
+})
+/** A file part. The Host takes these only as an agent-scoped upload receipt. */
+const fileRef = (attachmentId) => ({
+  type: 'file',
+  attachment: { attachmentId, name: 'notes.txt', bytes: 9 }
+})
 
 /** Workspace the fake source Session is accounted to; undefined means Ungrouped. */
 let sourceWorkspaceId
@@ -262,8 +272,10 @@ check(
   warnings.join(' | ') || '(no warning)'
 )
 
-// An attachment message cannot be resent as text, so double-click must do nothing.
-const attachTree = shim({ node: userNode(9, [text('see'), image('x')]), sessionId: 'session-x', useWorkspaces })
+// A message carrying a FILE attachment keeps the native menu: the Host accepts
+// files only as an agent-scoped upload receipt, and the client cannot read a
+// stored file's bytes to mint a fresh one. (Images are retryable — see 4c.)
+const fileTree = shim({ node: userNode(9, [text('see'), fileRef('att-file-1')]), sessionId: 'session-x', useWorkspaces })
 
 // --- 4b. context-menu entry ---------------------------------------------------
 const plainTarget = { closest: () => null }
@@ -299,11 +311,19 @@ const onButton = contextMenu(interactiveTarget)
 tree.props.onContextMenu(onButton)
 check('menu: ignores interactive descendants', stateCalls.length === 0 && !onButton.prevented, JSON.stringify(stateCalls))
 
-// An attachment message cannot be resent as text, so it keeps the native menu.
+// A file attachment has nothing this plugin can resend, so it keeps the native menu.
 stateCalls.length = 0
-const onAttachment = contextMenu(plainTarget)
-attachTree.props.onContextMenu(onAttachment)
-check('menu: ignores attachment messages', stateCalls.length === 0 && !onAttachment.prevented, JSON.stringify(stateCalls))
+const onFile = contextMenu(plainTarget)
+fileTree.props.onContextMenu(onFile)
+check('menu: ignores file attachments', stateCalls.length === 0 && !onFile.prevented, JSON.stringify(stateCalls))
+
+// An IMAGE, unlike a file, is retryable: the bytes are read back through the
+// source session's own attachment read, so the menu opens as usual.
+const imageTree = shim({ node: userNode(9, [text('see'), imageRef('att-img-1')]), sessionId: 'session-x', useWorkspaces })
+stateCalls.length = 0
+const onImage = contextMenu(plainTarget)
+imageTree.props.onContextMenu(onImage)
+check('menu: opens for image messages', onImage.prevented && stateCalls.some((call) => call?.left === 100), JSON.stringify(stateCalls))
 
 // The open menu offers two entries — retry first, the editor second, then a rule
 // and the delete-source toggle — and choosing the second enters the editor.
@@ -416,6 +436,10 @@ let selectionsById = {}
 /** The catalog rows `sourceTitle` reads the source's durable name from. */
 let titlesById = { 'session-1': '原始会话名' }
 const renameCalls = []
+/** Every `readAttachment` the retry made, in order — the image carry-over path. */
+const attachmentReads = []
+/** Attachment ids whose read must fail, to prove a bad image costs only itself. */
+let attachmentReadFailures = new Set()
 const sessions = {
   list: { getSnapshot: () => ({ byId: Object.fromEntries(Object.entries(titlesById).map(([id, title]) => [id, { title }])) }) },
   fork: (options) => {
@@ -431,6 +455,21 @@ const sessions = {
       getSnapshot: () => ({ entries: windowEntries, hasMore: windowHasMore, revision: 1, change: { kind: 'append', entries: [] } })
     },
     session: {
+      // The image carry-over: bytes come back base64-decoded from the source
+      // session's own attachment read, which is authorized against that session.
+      readAttachment: async (attachmentId) => {
+        attachmentReads.push({ sessionId: id, attachmentId })
+        if (attachmentReadFailures.has(attachmentId)) {
+          return { ok: false, error: { code: 'session/attachment-invalid', message: 'Image is not referenced by this session.' } }
+        }
+        return {
+          ok: true,
+          value: {
+            attachment: { attachmentId, mediaType: 'image/png', bytes: 3, width: 1, height: 1 },
+            data: new Uint8Array([1, 2, 3])
+          }
+        }
+      },
       projections: {
         // `faceOf` answers for EVERY key and reports absence as an undefined
         // snapshot — never as a missing face.
@@ -466,13 +505,13 @@ const { slots: submitSlots } = runApply('lowest', 'chat', {
 const submitShim = submitSlots.__entries.find((e) => e.component !== fakeShipped).component
 
 /** Drive the shim into its editor and click submit. */
-async function submitVia(seq, value, cwd, workspaceId, armed = false) {
+async function submitVia(seq, value, cwd, workspaceId, armed = false, extra = []) {
   sourceWorkspaceId = workspaceId
   // The shim's useState order is editing, busy, error, menu, deleteSource; an
   // omitted tail falls back to that slot's own initial value.
   useStateScript = armed ? [true, undefined, undefined, undefined, true] : [true]
   const host = submitShim({
-    node: userNode(seq, [text(value)]),
+    node: userNode(seq, [text(value), ...extra]),
     sessionId: 'session-1',
     cwd,
     t: fakeT,
@@ -493,11 +532,11 @@ async function submitVia(seq, value, cwd, workspaceId, armed = false) {
  * opens an editor and reaches the sessions service on a LATER submit, so a fork
  * and a prompt landing on this tick can only come from the retry entry.
  */
-async function retryVia(seq, value, cwd, workspaceId) {
+async function retryVia(seq, value, cwd, workspaceId, extra = []) {
   sourceWorkspaceId = workspaceId
   useStateScript = [false, undefined, undefined, { left: 10, top: 20 }]
   const host = submitShim({
-    node: userNode(seq, [text(value)]),
+    node: userNode(seq, [text(value), ...extra]),
     sessionId: 'session-1',
     cwd,
     t: fakeT,
@@ -851,6 +890,69 @@ fetchReply = { ok: false, status: 500, payload: { ok: false, error: 'session log
 await submitVia(21, '改过的', PKG, 'ws-1', true)
 check('delete: a rejected delete surfaces the host error', stateCalls.some((call) => typeof call === 'string' && call.startsWith('删除原会话失败：') && call.includes('session log could not be removed')), JSON.stringify(stateCalls))
 fetchReply = { ok: true, status: 200, payload: { ok: true } }
+
+// --- 5d-bis. images are carried across the fork --------------------------------
+// A durable message holds images as REFERENCES, so a retry has to read the bytes
+// back through the source session and re-upload them inline: that is the only
+// shape `session/prompt` accepts for an image, and the Host turns it back into a
+// durable reference on the way in.
+forkCalls.length = 0
+promptCalls.length = 0
+attachmentReads.length = 0
+await submitVia(21, '改过的', PKG, 'ws-1', false, [imageRef('att-img-1')])
+check('image: the retry reads the source image', attachmentReads.length === 1 && attachmentReads[0]?.attachmentId === 'att-img-1', JSON.stringify(attachmentReads))
+check('image: it reads through the SOURCE session', attachmentReads[0]?.sessionId === 'session-1', JSON.stringify(attachmentReads))
+const imageParts = promptCalls[0]?.content ?? []
+check('image: the prompt carries text then the image', imageParts.length === 2 && imageParts[0]?.type === 'text' && imageParts[1]?.type === 'image', JSON.stringify(imageParts))
+check('image: the image goes out as inline base64', imageParts[1]?.data === 'AQID' && imageParts[1]?.mediaType === 'image/png', JSON.stringify(imageParts[1]))
+
+// Order is preserved by the UNEDITED retry, which reuses every part verbatim:
+// text, image, text, image stays in that order, because a reordered prompt is a
+// different prompt. (The editor holds one text field, so an edited retry collapses
+// the text parts to one — see the implementation's note.)
+forkCalls.length = 0
+promptCalls.length = 0
+await retryVia(21, '看这两张', PKG, 'ws-1', [imageRef('att-img-1'), text('和'), imageRef('att-img-2')])
+const ordered = (promptCalls[0]?.content ?? []).map((part) => part.type).join(',')
+check('image: the original part order is kept', ordered === 'text,image,text,image', ordered)
+
+// An edited retry keeps the editor's text (which is every text part concatenated,
+// since the editor is a single field) and drops the now-redundant later text
+// parts, so nothing the user typed is lost and nothing is sent twice.
+promptCalls.length = 0
+await submitVia(21, '看这两张', PKG, 'ws-1', false, [imageRef('att-img-1'), text('和'), imageRef('att-img-2')])
+const editedTypes = (promptCalls[0]?.content ?? []).map((part) => part.type).join(',')
+const editedText = (promptCalls[0]?.content ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('')
+check('image: an edited mixed message keeps its full text', editedTypes === 'text,image,image' && editedText === '看这两张和', `${editedTypes} / ${editedText}`)
+
+// An image-only message is still a message: the editor may submit it, and the
+// retry sends the image with no text part at all.
+promptCalls.length = 0
+await submitVia(21, '', PKG, 'ws-1', false, [imageRef('att-img-1')])
+const onlyImage = promptCalls[0]?.content ?? []
+check('image: an image-only message retries', onlyImage.length === 1 && onlyImage[0]?.type === 'image', JSON.stringify(onlyImage))
+
+// A read that fails costs only that image: the retry still goes out, because the
+// user asked to resend the message, not to validate its attachments. The other
+// image is unaffected.
+promptCalls.length = 0
+attachmentReads.length = 0
+attachmentReadFailures = new Set(['att-img-1'])
+// `console.warn` was restored after the registration check, so capture again for
+// the duration of this retry — the drop warning is the thing under test.
+const dropWarnings = []
+const warnBeforeDrop = console.warn
+console.warn = (...args) => dropWarnings.push(args.join(' '))
+try {
+  await submitVia(21, '改过的', PKG, 'ws-1', false, [imageRef('att-img-1'), imageRef('att-img-2')])
+} finally {
+  console.warn = warnBeforeDrop
+}
+const survivors = promptCalls[0]?.content ?? []
+check('image: an unreadable image does not stop the retry', survivors.length === 2 && survivors[1]?.type === 'image', JSON.stringify(survivors))
+check('image: the readable image still goes out', attachmentReads.filter((read) => read.attachmentId === 'att-img-2').length === 1, JSON.stringify(attachmentReads))
+check('image: the dropped image is warned about', dropWarnings.some((line) => line.includes('att-img-1')), dropWarnings.join(' | ') || '(no warning)')
+attachmentReadFailures = new Set()
 
 // --- 5e. host half: the delete itself ------------------------------------------
 // The host half is driven for real: a temporary DSH_HOME holds actual session

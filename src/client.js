@@ -16,8 +16,12 @@
 // time), which is rendered inside the shipped component and cannot be extended
 // from outside, so it would end up as a second row fighting the shipped layout.
 // Double-click was tried and removed: it collides with the browser's
-// select-a-word gesture. Interactive descendants keep their own context menu, and
-// an attachment message cannot be resent as text, so both are excluded.
+// select-a-word gesture. Interactive descendants keep their own context menu.
+// Images ARE resent (read back through the session's own attachment read and
+// re-uploaded as inline bytes), but file attachments are not: the Host only
+// accepts them as a `receiptId` minted for one agent-scoped upload, and nothing
+// on the client can read a stored file's bytes to mint a fresh one. A message
+// carrying a file therefore keeps the native menu.
 //
 // Why fork instead of rewriting the log in place:
 //   The durable log is append-only (seq = log.length) and the transcript only
@@ -90,6 +94,7 @@ window.__ModuleLoader__.load({
       deleteSource: '重试后删除原会话',
       title: '编辑这条消息并重试',
       hint: '保存后从这里新建会话并立即发送',
+      hintImages: '图片会原样重发 · 保存后立即发送',
       submit: '保存并重试',
       cancel: '取消',
       sending: '正在重试…',
@@ -105,6 +110,7 @@ window.__ModuleLoader__.load({
       deleteSource: 'Delete the original session',
       title: 'Edit this message and retry',
       hint: 'Saving forks a new session from here and sends immediately',
+      hintImages: 'Images are resent as they were · saves and sends immediately',
       submit: 'Save and retry',
       cancel: 'Cancel',
       sending: 'Retrying…',
@@ -345,10 +351,106 @@ window.__ModuleLoader__.load({
       return out
     }
 
-    /** True when the message is pure text — the only shape this plugin resends. */
-    function isTextOnly(content) {
+    /**
+     * True when every part is a shape this plugin can resend: text, or an image
+     * it can read back and re-upload. A `file` part is neither — the Host takes
+     * files only as an agent-scoped `receiptId`, and the client has no way to
+     * read a stored file's bytes to mint a fresh one — so a message carrying one
+     * keeps the native menu.
+     */
+    function isRetryable(content) {
       if (!Array.isArray(content)) return false
-      return content.every((part) => part && part.type === 'text')
+      return content.every((part) => part && (part.type === 'text' || part.type === 'image'))
+    }
+
+    /** Every image part's durable reference, in message order. */
+    function imageRefsOf(content) {
+      if (!Array.isArray(content)) return []
+      const refs = []
+      for (const part of content) {
+        if (part?.type !== 'image') continue
+        const ref = part.attachment
+        if (ref === null || typeof ref !== 'object') continue
+        if (typeof ref.attachmentId !== 'string' || typeof ref.mediaType !== 'string') continue
+        refs.push({ attachmentId: ref.attachmentId, mediaType: ref.mediaType, name: ref.name })
+      }
+      return refs
+    }
+
+    /** Base64 of a byte array, chunked so a large image cannot blow the arg limit. */
+    function bytesToBase64(bytes) {
+      let binary = ''
+      const chunk = 0x8000
+      for (let offset = 0; offset < bytes.length; offset += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk))
+      }
+      return btoa(binary)
+    }
+
+    /**
+     * The content a retry sends, rebuilt from the source message.
+     *
+     * Images are read through the source session's own attachment read, which
+     * authorizes against that session's log — so this has to run while the source
+     * still exists (it does: the optional delete happens after the retry resolves).
+     * The bytes go out inline and the Host converts them back into durable
+     * references, which is the only way to carry an image across a fork.
+     *
+     * The message's own part ORDER is kept, because a reordered prompt is a
+     * different prompt. An untouched retry reuses each text part verbatim; an
+     * edited one replaces the text with what the editor holds, at the position of
+     * the first text part, since the editor is a single field and cannot express
+     * where in a mixed message its text belongs.
+     *
+     * A read that fails costs only that image: it is warned about and dropped, and
+     * the retry still goes out. Aborting would be worse than a missing picture,
+     * because the user asked to resend the message, not to validate its parts.
+     * @returns the prompt parts, in message order.
+     */
+    async function buildRetryParts(sessions, sessionId, text, content, edited) {
+      const parts = []
+      let textPlaced = false
+      const pushImage = async (ref) => {
+        const session = sessions.binding(sessionId)?.session
+        try {
+          const result = await session.readAttachment(ref.attachmentId)
+          if (result?.ok !== true) {
+            throw new Error(result?.error?.message ?? result?.error?.code ?? 'attachment read refused')
+          }
+          parts.push({
+            type: 'image',
+            mediaType: result.value.attachment?.mediaType ?? ref.mediaType,
+            data: bytesToBase64(result.value.data),
+            ...(ref.name === undefined ? {} : { name: ref.name })
+          })
+        } catch (error) {
+          console.warn(
+            `[edit-retry] retry drops an image it could not read (${ref.attachmentId}): ${String(error?.message ?? error)}`
+          )
+        }
+      }
+
+      for (const part of Array.isArray(content) ? content : []) {
+        if (part?.type === 'text') {
+          if (edited) {
+            // Only the first text part survives an edit: the editor shows one
+            // field, so every text part would otherwise be duplicated.
+            if (textPlaced) continue
+            textPlaced = true
+            if (text.length > 0) parts.push({ type: 'text', text })
+          } else if (typeof part.text === 'string' && part.text.length > 0) {
+            parts.push({ type: 'text', text: part.text })
+          }
+          continue
+        }
+        if (part?.type !== 'image') continue
+        for (const ref of imageRefsOf([part])) await pushImage(ref)
+      }
+
+      // An edited retry whose message carried no text part at all still has to
+      // send what the editor holds.
+      if (edited && !textPlaced && text.length > 0) parts.unshift({ type: 'text', text })
+      return parts
     }
 
     // --- the shipped `user` renderer --------------------------------------------
@@ -501,11 +603,16 @@ window.__ModuleLoader__.load({
      * that older turn, not the one the user has selected now.
      * @returns the retry session id.
      */
-    async function retryFrom(ctx, { sessionId, seq, cwd, workspaceId }, text) {
+    async function retryFrom(ctx, { sessionId, seq, cwd, workspaceId, content }, text, edited = true) {
       const sessions = ctx.get('sessions')
       const workspace = ctx.get('uiWorkspace')
       if (sessions === undefined) throw new Error('sessions service unavailable')
       if (workspace === undefined) throw new Error('uiWorkspace service unavailable')
+
+      // Read the source's images BEFORE forking or deleting anything: the read is
+      // authorized against the source session's log, so it has to happen while the
+      // source is still there.
+      const parts = await buildRetryParts(sessions, sessionId, text, content, edited)
 
       // Read BEFORE forking: this is the model the source was showing when the user
       // chose to retry, and no prefix of the source's log necessarily contains it.
@@ -546,7 +653,7 @@ window.__ModuleLoader__.load({
         } catch (error) {
           console.warn(`[edit-retry] retry runs on the inherited model: ${String(error?.message ?? error)}`)
         }
-        await reference.binding.session.prompt([{ type: 'text', text }], 'queue')
+        await reference.binding.session.prompt(parts, 'queue')
       })
 
       return targetId
@@ -662,15 +769,17 @@ window.__ModuleLoader__.load({
     }
 
     // --- components -------------------------------------------------------------
-    function EditRetryEditor({ t, initial, busy, error, onSubmit, onCancel }) {
+    function EditRetryEditor({ t, initial, busy, error, onSubmit, onCancel, hasImages }) {
       const [value, setValue] = useState(initial)
       const trimmed = value.trim()
-      const canSubmit = trimmed.length > 0 && !busy
+      // The editor only edits text; an image-only message has no text to require,
+      // and the images are resent untouched alongside whatever text is left.
+      const canSubmit = (trimmed.length > 0 || hasImages) && !busy
 
       const submit = useCallback(() => {
-        if (trimmed.length === 0 || busy) return
+        if ((trimmed.length === 0 && !hasImages) || busy) return
         onSubmit(trimmed)
-      }, [trimmed, busy, onSubmit])
+      }, [trimmed, hasImages, busy, onSubmit])
 
       const onKeyDown = useCallback(
         (event) => {
@@ -705,7 +814,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-edit-retry-row' },
-          h('span', { className: 'dsh-edit-retry-hint' }, busy ? t.sending : t.hint),
+          h('span', { className: 'dsh-edit-retry-hint' }, busy ? t.sending : hasImages ? t.hintImages : t.hint),
           h(
             'button',
             {
@@ -807,10 +916,13 @@ window.__ModuleLoader__.load({
           // renderer reads it the same way — `const data = node.data`.
           const data = props.node.data
           const content = data.content
-          const textOnly = isTextOnly(content)
+          const retryable = isRetryable(content)
           // The text as sent, reused verbatim by the retry. Trimmed exactly
           // like the editor's own submit, so both entries send the same prompt.
           const original = textOf(content).trim()
+          // Whether the message carries anything besides text — the editor can
+          // only change the text, so those parts are resent as they were.
+          const hasImages = imageRefsOf(content).length > 0
           // Prefer a fresh lookup: a reload can replace the shipped entry.
           const Body = shippedUserEntry(ctx, EditRetryUserNode)?.component ?? shipped.component
 
@@ -822,7 +934,7 @@ window.__ModuleLoader__.load({
           )
 
           const onSubmit = useCallback(
-            (text) => {
+            (text, edited = true) => {
               // `busy` doubles as the phase: the retry and the delete that may follow
               // it are one continuous operation, and the status row has to say which
               // half is running. The failure label needs the same distinction, which
@@ -833,8 +945,9 @@ window.__ModuleLoader__.load({
               setError(undefined)
               retryFrom(
                 ctx,
-                { sessionId: props.sessionId, seq: data.seq, cwd: props.cwd, workspaceId },
-                text
+                { sessionId: props.sessionId, seq: data.seq, cwd: props.cwd, workspaceId, content },
+                text,
+                edited
               )
                 .then(async (targetId) => {
                   setEditing(false)
@@ -864,24 +977,28 @@ window.__ModuleLoader__.load({
                 })
                 .finally(() => setBusy(undefined))
             },
-            [props.sessionId, props.cwd, workspaceId, data.seq, deleteSource, t]
+            [props.sessionId, props.cwd, workspaceId, data.seq, deleteSource, t, content]
           )
 
           // Retry: the same path with the text untouched, for when the edit was
-          // never the point — the message just deserves another run. Guarded on empty
-          // text because a retry that sends nothing is not a retry.
+          // never the point — the message just deserves another run. Guarded on
+          // empty content because a retry that sends nothing is not a retry: text
+          // OR an image will do, an image-only message is still a message.
           const onRetry = useCallback(() => {
             setMenu(undefined)
-            if (original.length === 0 || busy) return
-            onSubmit(original)
-          }, [original, busy, onSubmit])
+            if ((original.length === 0 && !hasImages) || busy) return
+            // `false`: nothing was edited, so each text part is resent verbatim
+            // rather than collapsed into the editor's single field.
+            onSubmit(original, false)
+          }, [original, hasImages, busy, onSubmit])
 
           // Opening the menu. Interactive descendants keep their own context menu,
           // so the shipped copy control and any link in the message are left alone;
-          // an attachment message has nothing to offer and keeps the native menu.
+          // a message carrying a file attachment has nothing to offer and keeps the
+          // native menu (images are fine — they are read back and re-sent).
           const onContextMenu = useCallback(
             (event) => {
-              if (!textOnly) return
+              if (!retryable) return
               if (event.target.closest(INTERACTIVE) !== null) return
               event.preventDefault()
               setMenu({
@@ -889,7 +1006,7 @@ window.__ModuleLoader__.load({
                 top: Math.min(event.clientY, window.innerHeight - MENU_HEIGHT)
               })
             },
-            [textOnly]
+            [retryable]
           )
 
           // Dismiss on pointer elsewhere, Escape, or any scroll. Capture phase so a
@@ -924,6 +1041,7 @@ window.__ModuleLoader__.load({
                 initial: textOf(content),
                 busy,
                 error,
+                hasImages,
                 onSubmit,
                 onCancel: () => setEditing(false)
               })
@@ -967,7 +1085,7 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'dsh-edit-retry-menuitem',
                       role: 'menuitem',
-                      disabled: original.length === 0 || busy !== undefined,
+                      disabled: (original.length === 0 && !hasImages) || busy !== undefined,
                       onClick: onRetry
                     },
                     t.retry
