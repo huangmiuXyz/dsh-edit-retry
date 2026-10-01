@@ -14,7 +14,7 @@
 |---|---|
 | **重试** | 原样重发这条消息，不做任何编辑 |
 | **编辑并重试** | 气泡原地变成编辑器（预填原文），改完再发 |
-| **重试后删除原会话** | 一个开关，勾上后上面两条动作完成后会删掉源会话 |
+| **重试后删除原会话** | 一个开关，勾上后上面两条动作完成后会删掉源会话，并让新会话**继承它的名字** |
 
 编辑器里回车换行、`⌘/Ctrl + Enter` 保存、`Esc` 取消。两条动作的后续完全一样：
 
@@ -25,7 +25,7 @@
 
 整个过程复用的是 DSH 自带「分支」按钮的同一条路径，所以权限和行为跟原生功能一致。
 
-选择后菜单就关闭了，因此进度和失败会显示在气泡下方（「正在重试…」/「正在删除原会话…」/「重试失败：原因」/「删除原会话失败：原因」）—— 编辑那条路径则复用编辑器自己的提示行。
+选择后菜单就关闭了，因此进度和失败会显示在气泡下方（「正在重试…」/「正在删除原会话…」/「正在继承原会话名…」/「重试失败：原因」/「删除原会话失败：原因」/「改名失败：原因」）—— 编辑那条路径则复用编辑器自己的提示行。
 
 ## 为什么重试前面不会多一行「用时 N 秒」
 
@@ -53,6 +53,8 @@
 ## 删除原会话
 
 删除是**可选、永久**的，所以它默认关闭、状态记在 `localStorage` 里（勾一次就一直是勾上的），而且**只在重试真的发出去之后**才执行 —— 重试失败会保留源会话，因为那时它是这段对话唯一的副本。
+
+删除成功后，**新会话会改名成被删掉的那个会话的名字**：源会话没了，它的名字就空出来了，与其让新会话顶着分叉自带的「原名 (1)」，不如直接继承。名字在**删除之前**读取（删除会把标题所在的投影一并清掉，之后再读就是空的），改名走 `session.rename` 契约 —— 也就是分叉路径自己 `increaseTitle` 内部用的同一个调用，所以侧边栏和标题投影会同步更新。源会话在目录里查不到标题时跳过改名，改名失败只在气泡下方报「改名失败：原因」，不会影响已经完成的删除。
 
 DSH **没有**给客户端插件任何删除会话的能力：workspace 面只提供 `archiveSession`（可逆，日志还在盘上），agent 协议的 `session_delete` 是给外部 ACP agent 用的，而会话存储根本没有公开的删除接口。所以删除做在**宿主半边**（`src/index.js`），顺序是有讲究的：
 
@@ -170,7 +172,7 @@ node test/check.mjs
 
 ## English
 
-**Resend any user message.** Right-click a message in the transcript to either **retry it as-is** or **edit it first** — either way DSH forks a new session from just before that message and sends the text as its first prompt. A separated toggle below the two entries can also **delete the source session** once the retry is in flight.
+**Resend any user message.** Right-click a message in the transcript to either **retry it as-is** or **edit it first** — either way DSH forks a new session from just before that message and sends the text as its first prompt. A separated toggle below the two entries can also **delete the source session** once the retry is in flight, and the retry then **inherits its name**.
 
 A DSH plugin with both halves.
 
@@ -178,7 +180,7 @@ A DSH plugin with both halves.
 - **Which model the retry runs on: the one you have selected now.** Two DSH rules combine into a surprise here — a fork inherits only the event *prefix* up to the retry point, and a Host resolves a session's model from that session's *own* log (its last `request/header` route, or an unconsumed `model/selection`). So the most natural flow, switching models and then retrying an older message, used to run the child on the model that older turn happened to use. The retry therefore reads the source's `modelSelection` projection — exactly what the composer shows — and installs it on the child through the same `session/selectModel` RPC the composer's model control submits through, before the child's first prompt. When the child already resolves to the same route nothing is written; when the route is gone (or the session is held by another writer) the retry is still sent and only a console warning is left behind. One consequence worth knowing: the Host treats that RPC like a manual pick and also saves the selection as the deployment default.
 - **Install:** `dsh plugin --profile <profile> add github:huangmiuXyz/dsh-edit-retry`, then restart DSH. The CLI forwards to pnpm in the profile directory and registers the bundle entry for you. The bare name does not resolve yet — the package is not on npm — and the Desktop app's own profile (`--profile desktop`) refuses the CLI, so install it there through the in-app plugin manager instead.
 - **Two entries:** *Retry* resends the text untouched; *Edit and retry* opens an editor first. Both share one fork rule and one resend path, so only the text differs. Because the menu closes on click, the operation reports progress and failure in a status line under the bubble.
-- **Deleting the source is opt-in and permanent.** DSH gives client plugins no way to delete a session — the workspace surface only archives, and the session store has no public remove API — so the delete lives in the **host half** and is reached over an HTTP route the host registers. It force-stops the agent, flushes, detaches the live entry, removes the on-disk log in both id spellings, *confirms it is gone*, and only then clears the workspace and projection accounting, because a half-deleted session is worse than an undeleted one. It runs only after the retry actually got in flight: a failed retry leaves the source alone. The route requires a custom header, which is what forces a CORS preflight and keeps other pages out, and session ids are charset-validated and path-containment-checked before touching the filesystem.
+- **Deleting the source is opt-in and permanent.** DSH gives client plugins no way to delete a session — the workspace surface only archives, and the session store has no public remove API — so the delete lives in the **host half** and is reached over an HTTP route the host registers. It force-stops the agent, flushes, detaches the live entry, removes the on-disk log in both id spellings, *confirms it is gone*, and only then clears the workspace and projection accounting, because a half-deleted session is worse than an undeleted one. It runs only after the retry actually got in flight: a failed retry leaves the source alone. The route requires a custom header, which is what forces a CORS preflight and keeps other pages out, and session ids are charset-validated and path-containment-checked before touching the filesystem. Once it succeeds, the **retry takes over the deleted session's name**: the title is read *before* the delete (which strips the projection it lives in) and written through the `session.rename` contract — the very call the fork path's own `increaseTitle` makes — so the sidebar row and the title projection stay in step. A source the catalog has no title for skips the rename, and a refused rename reports "Could not rename the retry" without disturbing the completed delete.
 - **Boundaries:** text-only messages are retryable (attachments keep the native menu); right-click is the only entry point; interactive descendants keep their own context menu; blank text disables *Retry* while *Edit and retry* stays available; the first human prompt opens a fresh session while later prompts fork at the previous turn's **closed** boundary — a message injected mid-turn keeps its predecessor, because cutting earlier would drop messages the caller can still see; the retry adopts the source's currently selected model and falls back to the inherited one if that route is unavailable.
 - **Caveat:** the delete walks into DSH internals (`sessions.store` / `detachEntered` / `storageDomain` shapes / the on-disk layout). Every step is feature-probed, so an upgrade degrades this to a refused or partial delete rather than a crash — but it can break. Also, the sidebar row for a deleted session may linger until the next reload; DSH exposes no client-side refresh, and reloading the page would interrupt the retry that was just sent.
 - **How:** the plugin shadows the shipped `user` chat node at priority `-1` and renders the shipped component through `ctx.slots.entries()`, forwarding its `locale` seat so the shipped bubble keeps its `t`. The client half imports nothing but React.

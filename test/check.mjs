@@ -413,7 +413,11 @@ let windowHasMore = false
  * selection of its own.
  */
 let selectionsById = {}
+/** The catalog rows `sourceTitle` reads the source's durable name from. */
+let titlesById = { 'session-1': '原始会话名' }
+const renameCalls = []
 const sessions = {
+  list: { getSnapshot: () => ({ byId: Object.fromEntries(Object.entries(titlesById).map(([id, title]) => [id, { title }])) }) },
   fork: (options) => {
     forkCalls.push(options)
     return Promise.resolve('session-child')
@@ -444,6 +448,11 @@ const sessions = {
           prompt: async (content, mode) => {
             promptCalls.push({ target, content, mode })
             callOrder.push('prompt')
+          },
+          rename: async (title) => {
+            renameCalls.push({ target, title })
+            callOrder.push('rename')
+            return { ok: true, value: { title, seq: 1 } }
           }
         }
       }
@@ -748,8 +757,12 @@ check('delete: the client and host agree on the header', ownClientSource().inclu
 
 const fetchCalls = []
 let fetchReply = { ok: true, status: 200, payload: { ok: true, sessionId: 'session-1', dirsRemoved: 1 } }
+// Records the delete's completion so the rename's ordering can be asserted: the
+// delete must land first, or the name it reads would already be gone.
+let deletedAt
 globalThis.fetch = async (url, options) => {
   fetchCalls.push({ url, options })
+  deletedAt = renameCalls.length
   return {
     ok: fetchReply.ok,
     status: fetchReply.status,
@@ -775,6 +788,44 @@ check('delete: the request carries the guard header', fetchCalls[0]?.options?.he
 check('delete: it names the SOURCE session, not the retry', JSON.parse(fetchCalls[0]?.options?.body ?? '{}').sessionId === 'session-1', String(fetchCalls[0]?.options?.body))
 check('delete: the retry is sent before the delete', promptCalls.length === 1 && fetchCalls.length === 1, JSON.stringify({ promptCalls: promptCalls.length, fetchCalls: fetchCalls.length }))
 check('delete: the phase is announced before the call', stateCalls.includes('delete'), JSON.stringify(stateCalls))
+
+// Deleting the source frees its name, so the retry inherits it outright — read
+// BEFORE the delete, because the delete strips the projection the name lives in.
+check('rename: the retry inherits the deleted name', renameCalls.length === 1 && renameCalls[0]?.title === '原始会话名', JSON.stringify(renameCalls))
+check('rename: it renames the RETRY, not the source', renameCalls[0]?.target === 'session-child', JSON.stringify(renameCalls))
+// The delete saw ZERO renames so far, and exactly one followed it.
+check('rename: the source is deleted before the rename', deletedAt === 0 && renameCalls.length === 1, `deletedAt=${deletedAt}, renames=${renameCalls.length}`)
+check('rename: the phase is announced', stateCalls.includes('rename'), JSON.stringify(stateCalls))
+
+// No name to inherit — the catalog has no row for the source — must not rename
+// (nor throw): an unnamed retry keeps the fork's own title.
+renameCalls.length = 0
+fetchCalls.length = 0
+titlesById = {}
+await submitVia(21, '改过的', PKG, 'ws-1', true)
+check('rename: an unnamed source is left alone', renameCalls.length === 0 && fetchCalls.length === 1, JSON.stringify({ renameCalls, fetchCalls: fetchCalls.length }))
+titlesById = { 'session-1': '原始会话名' }
+
+// A refused rename is reported as a rename failure — the source is already gone,
+// so this must not read as a failed retry or a failed delete.
+renameCalls.length = 0
+stateCalls.length = 0
+const realRename = sessions.using
+sessions.using = async (target, options, operation) =>
+  operation({
+    sessionId: target,
+    ready: Promise.resolve(),
+    binding: {
+      sessionId: target,
+      session: {
+        prompt: async (content, mode) => { promptCalls.push({ target, content, mode }) },
+        rename: async () => { throw new Error('title rejected') }
+      }
+    }
+  })
+await submitVia(21, '改过的', PKG, 'ws-1', true)
+check('rename: a refused rename surfaces its own error', stateCalls.some((call) => typeof call === 'string' && call.startsWith('改名失败：') && call.includes('title rejected')), JSON.stringify(stateCalls))
+sessions.using = realRename
 
 // Disarmed: the very same retry must not touch the source at all.
 forkCalls.length = 0

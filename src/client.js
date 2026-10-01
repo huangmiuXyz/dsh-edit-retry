@@ -94,8 +94,10 @@ window.__ModuleLoader__.load({
       cancel: '取消',
       sending: '正在重试…',
       deleting: '正在删除原会话…',
+      renaming: '正在继承原会话名…',
       failed: '重试失败：',
-      deleteFailed: '删除原会话失败：'
+      deleteFailed: '删除原会话失败：',
+      renameFailed: '改名失败：'
     }
     const EN = {
       retry: 'Retry',
@@ -107,8 +109,10 @@ window.__ModuleLoader__.load({
       cancel: 'Cancel',
       sending: 'Retrying…',
       deleting: 'Deleting the original session…',
+      renaming: 'Inheriting the original name…',
       failed: 'Retry failed: ',
-      deleteFailed: 'Could not delete the original session: '
+      deleteFailed: 'Could not delete the original session: ',
+      renameFailed: 'Could not rename the retry: '
     }
 
     function copyFor(ctx) {
@@ -164,6 +168,39 @@ window.__ModuleLoader__.load({
         throw new Error(payload?.error ?? `HTTP ${response.status}`)
       }
       return payload
+    }
+
+    /**
+     * The source session's durable title, read while it still has one.
+     *
+     * The delete strips the source's projections, so the name has to be captured
+     * BEFORE the route runs — afterwards there is nothing left to read it from.
+     * This is the same `byId[id].title` the fork path's own `increaseTitle` reads.
+     * @returns the title, or undefined when the catalog has none for this session.
+     */
+    function sourceTitle(ctx, sessionId) {
+      try {
+        const title = ctx.get('sessions')?.list?.getSnapshot?.()?.byId?.[sessionId]?.title
+        return typeof title === 'string' && title.length > 0 ? title : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    /**
+     * Rename a session through the `session.rename` contract — the same call the
+     * fork path makes internally for `increaseTitle`, which is what keeps the
+     * sidebar row and any title projection reader in step.
+     * @returns true when the Host accepted the title.
+     */
+    async function renameSession(ctx, sessionId, title) {
+      const sessions = ctx.get('sessions')
+      if (sessions === undefined) return false
+      return sessions.using(sessionId, { source: SOURCE }, async (reference) => {
+        await reference.ready
+        const result = await reference.binding.session.rename(title)
+        return result?.ok === true
+      })
     }
 
     // --- styles -----------------------------------------------------------------
@@ -799,18 +836,31 @@ window.__ModuleLoader__.load({
                 { sessionId: props.sessionId, seq: data.seq, cwd: props.cwd, workspaceId },
                 text
               )
-                .then(async () => {
+                .then(async (targetId) => {
                   setEditing(false)
                   // Only now: the retry is in flight, so the source is genuinely
                   // redundant. A failed retry leaves the source untouched.
                   if (!deleteSource) return
+                  // Read the name BEFORE the delete: removing the source strips the
+                  // projections it lives in, so afterwards there is nothing to read.
+                  const title = sourceTitle(ctx, props.sessionId)
                   phase = 'delete'
                   setBusy('delete')
                   await deleteSourceSession(props.sessionId)
+                  // The source is gone, so its name is free: the retry inherits it
+                  // outright instead of the fork's numbered "title (1)".
+                  if (title === undefined) return
+                  phase = 'rename'
+                  setBusy('rename')
+                  await renameSession(ctx, targetId, title)
                 })
                 .catch((failure) => {
                   const message = String(failure?.message ?? failure)
-                  setError(`${phase === 'delete' ? t.deleteFailed : t.failed}${message}`)
+                  setError(
+                    phase === 'rename'
+                      ? `${t.renameFailed}${message}`
+                      : `${phase === 'delete' ? t.deleteFailed : t.failed}${message}`
+                  )
                 })
                 .finally(() => setBusy(undefined))
             },
@@ -896,7 +946,7 @@ window.__ModuleLoader__.load({
                     ? h(
                         'span',
                         { className: 'dsh-edit-retry-hint' },
-                        busy === 'delete' ? t.deleting : t.sending
+                        busy === 'delete' ? t.deleting : busy === 'rename' ? t.renaming : t.sending
                       )
                     : h('span', { className: 'dsh-edit-retry-error' }, error)
                 )
