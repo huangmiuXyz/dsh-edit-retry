@@ -1,9 +1,10 @@
 // Edit-and-retry — CLIENT half.
 //
-// Right-clicking an ordinary user message opens a context menu: "Retry" resends the
-// text untouched, "Edit and retry" swaps the bubble for an inline editor first, and a
+// Right-clicking a user message opens a context menu: "Retry" resends the text
+// untouched, "Edit and retry" swaps the bubble for an inline editor first, and a
 // separated toggle below them arms "delete the source session once the retry is in
-// flight".
+// flight". A prompt injected into a running turn renders as a `steering` node and
+// gets the same menu: it is a human message like any other, only anchored mid-turn.
 //
 // Either entry produces a retry session carrying that text as its prompt — the edit
 // is optional, the retry is not. The delete is opt-in and permanent, so it runs only
@@ -41,12 +42,18 @@
 //   composer shows) and pins it on the child before its first prompt.
 //
 // How the bubble is wrapped without copying it:
-//   The shipped `conversation.chat.node` entry for key "user" sits at the default
-//   priority 0. This profile-installed Client half registers the SAME key at
-//   priority -1: the renderer elects the first non-abdicated entry of each cell
-//   in priority order, so the lower number shadows the shipped one. The shim then
-//   renders the SHIPPED component through `ctx.slots.entries()`, so bubble
-//   styling, image rendering, copy and timestamps stay owned by the product.
+//   The shipped `conversation.chat.node` entries for the cells "user" and
+//   "steering" sit at the default priority 0. This profile-installed Client half
+//   registers the SAME cells at priority -1: the renderer elects the first
+//   non-abdicated entry of each cell in priority order, so the lower number
+//   shadows the shipped one. The shim then renders the SHIPPED component through
+//   `ctx.slots.entries()`, so bubble styling, image rendering, copy and
+//   timestamps stay owned by the product.
+//
+//   Both cells are needed even though the shipped renderer is one component: the
+//   seat is keyed by the NODE's kind, so a shim registered on "user" alone never
+//   sees a message the transcript classified as steering — which is exactly the
+//   case where the menu used to go missing without a trace.
 //
 //   Do not omit the priority. The automatic shadowing-rank allocation in the
 //   Client runtime applies to DYNAMIC packages only; a bundle loaded through the
@@ -66,7 +73,16 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const SLOT = 'conversation.chat.node'
-    const KEY = 'user'
+    /**
+     * The two cells this plugin shadows, in registration order.
+     *
+     * The shipped renderer serves BOTH from one component (`UserMessageNodeView`),
+     * but the seat is keyed by the NODE's kind, so shadowing "user" alone leaves
+     * every steering message on the shipped entry — no menu, and no hint why. A
+     * prompt injected into a running turn is classified `steering`; it is a human
+     * message and is retried exactly like the turn-opening one.
+     */
+    const KEYS = ['user', 'steering']
     /** Label carried by the temporary reference this plugin holds while sending. */
     const SOURCE = 'editRetry'
     const CSS_ID = 'dsh-edit-retry/EditRetry.css'
@@ -453,17 +469,20 @@ window.__ModuleLoader__.load({
       return parts
     }
 
-    // --- the shipped `user` renderer --------------------------------------------
+    // --- the shipped renderer --------------------------------------------
     /**
-     * Recover the SHIPPED `user` entry. The raw `entries()` view still holds it
-     * even though this plugin's entry wins the cell.
+     * Recover the SHIPPED entry of ONE cell. The raw `entries()` view still holds
+     * it even though this plugin's entry wins the cell.
      *
      * The whole entry matters, not just its component: its `locale` namespace is
      * what makes the renderer inject the `t` seat, and the shipped bubble's action
      * row calls `t`. Forwarding props without that seat crashes the shipped node.
+     * @param key - the cell whose shipped entry to recover.
+     * @param isOurs - identifies entries belonging to this plugin, which are not
+     *   the shipped one however they are registered.
      * @returns the shipped entry, or undefined while it has not registered.
      */
-    function shippedUserEntry(ctx, self) {
+    function shippedEntry(ctx, key, isOurs = () => false) {
       let raw
       try {
         raw = ctx.slots.entries(SLOT)
@@ -472,8 +491,8 @@ window.__ModuleLoader__.load({
       }
       if (!Array.isArray(raw)) return undefined
       for (const entry of raw) {
-        if (entry?.options?.key !== KEY) continue
-        if (entry.component === self) continue
+        if (entry?.options?.key !== key) continue
+        if (isOurs(entry.component)) continue
         return entry
       }
       return undefined
@@ -856,6 +875,9 @@ window.__ModuleLoader__.load({
       ctx.slots.inject(SLOT, () => {
         let timer
         let attempts = 0
+        /** Cells already seated, and the shims that own them. */
+        const seated = new Set()
+        const ours = []
 
         ctx.effect(
           () => () => {
@@ -866,36 +888,46 @@ window.__ModuleLoader__.load({
 
         const attempt = () => {
           timer = undefined
-          // ui-chat is a declared dsh.client.inject dependency, so its `user`
-          // entry normally exists already; retry briefly rather than seating a
-          // shim that could not render the shipped bubble.
-          const shipped = shippedUserEntry(ctx)
-          if (shipped === undefined) {
-            if (attempts++ < 40) {
-              timer = setTimeout(attempt, 25)
-              return
+          // Each cell is waited for on its own: ui-chat is a declared
+          // dsh.client.inject dependency, so both normally exist on the first
+          // pass, but one that is missing (an older ui-chat with no `steering`
+          // cell) must not cost the other its menu.
+          const pending = []
+          for (const key of KEYS) {
+            if (seated.has(key)) continue
+            const shipped = shippedEntry(ctx, key, (component) => ours.includes(component))
+            if (shipped === undefined) {
+              pending.push(key)
+              continue
             }
-            console.warn('[edit-retry] shipped "user" chat node never registered')
+            seated.add(key)
+            // The renderer keys the `t` seat off `entry.locale` (renderer:
+            // `if (entry.locale !== void 0) kit["t"] = localeSeat(face, entry.locale)`),
+            // and the registry is what puts it there, hoisting it OUT of `options`
+            // (`...options.locale !== void 0 ? { locale: options.locale } : {}`).
+            // `entry.locale` is therefore the whole contract — no fallback.
+            const locale = shipped.locale
+            if (locale === undefined) {
+              console.warn(
+                `[edit-retry] shipped "${key}" node declares no locale namespace; forwarded props will carry no \`t\` seat`
+              )
+            }
+            const shim = makeShim(shipped, ctx, key)
+            ours.push(shim)
+            seat(ctx, shim, locale, key)
+          }
+          if (pending.length === 0) return
+          if (attempts++ < 40) {
+            timer = setTimeout(attempt, 25)
             return
           }
-          // The renderer keys the `t` seat off `entry.locale` (renderer:
-          // `if (entry.locale !== void 0) kit["t"] = localeSeat(face, entry.locale)`),
-          // and the registry is what puts it there, hoisting it OUT of `options`
-          // (`...options.locale !== void 0 ? { locale: options.locale } : {}`).
-          // `entry.locale` is therefore the whole contract — no fallback.
-          const locale = shipped.locale
-          if (locale === undefined) {
-            console.warn(
-              '[edit-retry] shipped "user" node declares no locale namespace; forwarded props will carry no `t` seat'
-            )
-          }
-          seat(ctx, makeShim(shipped, ctx), locale)
+          console.warn(`[edit-retry] shipped chat node(s) never registered: ${pending.join(', ')}`)
         }
 
         attempt()
       })
 
-      function makeShim(shipped, ctx) {
+      function makeShim(shipped, ctx, key) {
         return function EditRetryUserNode(props) {
           const [editing, setEditing] = useState(false)
           // undefined while idle, otherwise the phase: 'retry' | 'delete'.
@@ -923,8 +955,10 @@ window.__ModuleLoader__.load({
           // Whether the message carries anything besides text — the editor can
           // only change the text, so those parts are resent as they were.
           const hasImages = imageRefsOf(content).length > 0
-          // Prefer a fresh lookup: a reload can replace the shipped entry.
-          const Body = shippedUserEntry(ctx, EditRetryUserNode)?.component ?? shipped.component
+          // Prefer a fresh lookup of THIS cell's shipped entry: a reload can
+          // replace it, and a cell this shim does not own is not its business.
+          const Body = shippedEntry(ctx, key, (component) => component === EditRetryUserNode)?.component
+            ?? shipped.component
 
           // The Workspace this Session is accounted to, read through the slot's own
           // standard `useWorkspaces` seat. A retry must land in the same sidebar
@@ -1140,26 +1174,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Register the shim at the priority that shadows the shipped `user` entry,
-     * forwarding the shipped entry's `locale` seat, then confirm the renderer
+     * Register one cell's shim at the priority that shadows that cell's shipped
+     * entry, forward the shipped entry's `locale` seat, then confirm the renderer
      * elected it.
+     * @param key - the cell this shim owns ("user" or "steering").
      */
-    function seat(ctx, component, locale) {
+    function seat(ctx, component, locale, key) {
       // The shipped entry holds priority 0 and a cell's first non-abdicated entry
       // wins in priority order, so a lower number shadows it. The `locale` seat
       // must be forwarded as well: the shipped bubble's action row calls `t`.
       ctx.slots.register(
-        { name: SLOT, key: KEY, priority: -1, ...(locale === undefined ? {} : { locale }) },
+        { name: SLOT, key, priority: -1, ...(locale === undefined ? {} : { locale }) },
         component
       )
       let elected
       try {
-        elected = ctx.slots.entriesOfSlot(SLOT)?.find((entry) => entry?.options?.key === KEY)
+        elected = ctx.slots.entriesOfSlot(SLOT)?.find((entry) => entry?.options?.key === key)
       } catch {
         elected = undefined
       }
       if (elected !== undefined && elected.component !== component) {
-        console.warn('[edit-retry] another entry owns the "user" chat-node cell')
+        console.warn(`[edit-retry] another entry owns the "${key}" chat-node cell`)
       }
     }
 

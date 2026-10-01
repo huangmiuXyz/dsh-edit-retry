@@ -118,6 +118,25 @@ function userNode(seq, content) {
     data: { kind: 'user', seq, time: 0, content, source: { kind: 'user' } }
   }
 }
+
+/**
+ * A faithful `ChatNode<'steering'>`: a human prompt the next-step inbox claimed
+ * while a turn was already running. Same `data` record as `user` (both come from
+ * one `user/message` event), a different `kind` — and the seat dispatches on the
+ * kind, which is why the plugin has to shadow the cell separately.
+ */
+function steeringNode(seq, content) {
+  return {
+    key: 'chat:steering',
+    kind: 'steering',
+    id: `node-${seq}`,
+    target: 'chat',
+    anchorSeq: seq,
+    location: {},
+    visibility: 'visible',
+    data: { kind: 'steering', messageId: `msg-${seq}`, seq, time: 0, content, source: { kind: 'user' } }
+  }
+}
 const text = (value) => ({ type: 'text', text: value })
 const image = (data) => ({ type: 'image', mediaType: 'image/png', data })
 /** An image part as a DURABLE message holds it: a reference, not inline bytes. */
@@ -154,11 +173,16 @@ function makeSlots(rule, shippedLocale = 'chat') {
   // onto the entry, and the renderer keys the `t` seat off `entry.locale`.
   // `null` is the sentinel for "declares no namespace" (an explicit `undefined`
   // would just re-trigger the default parameter).
-  const entries = [{
-    options: { key: 'user', priority: 0 },
+  //
+  // BOTH cells are seeded, because the shipped registry serves `user` and
+  // `steering` from the same component (register-node-renderers.ts). Seeding only
+  // `user` would let a shim that never shadows `steering` pass this file while
+  // every mid-turn message in the product kept the native menu.
+  const entries = SHIPPED_KEYS.map((key) => ({
+    options: { key, priority: 0 },
     ...(shippedLocale === null ? {} : { locale: shippedLocale }),
     component: fakeShipped
-  }]
+  }))
   return {
     // `entries(slotKey)` returns every entry of that SLOT, raw — not filtered by cell key.
     entries: () => entries.slice(),
@@ -186,6 +210,14 @@ function makeSlots(rule, shippedLocale = 'chat') {
     },
     __entries: entries
   }
+}
+
+/** The cells the shipped registry serves from one renderer. */
+const SHIPPED_KEYS = ['user', 'steering']
+
+/** This plugin's shim for one cell, or undefined when that cell was not shadowed. */
+function shimFor(slots, key) {
+  return slots.__entries.find((entry) => entry.component !== fakeShipped && entry.options?.key === key)?.component
 }
 
 function runApply(rule = 'lowest', shippedLocale = 'chat', services = {}) {
@@ -217,15 +249,19 @@ function runApply(rule = 'lowest', shippedLocale = 'chat', services = {}) {
 const { injectedKey, slots } = runApply()
 const mine = slots.__entries.filter((e) => e.component !== fakeShipped)
 check('seat: injects into conversation.chat.node', injectedKey === 'conversation.chat.node', injectedKey)
-check('seat: exactly one shim registered', mine.length === 1, String(mine.length))
-check('seat: registers key "user"', mine[0]?.options?.key === 'user', mine[0]?.options?.key)
-check('seat: shadows the shipped entry from below', mine[0]?.__passed?.priority === -1, String(mine[0]?.__passed?.priority))
+// Two cells, two shims: `user` alone leaves every mid-turn steering message on
+// the shipped entry, where the menu silently does not exist.
+check('seat: shadows every shipped human-message cell', mine.length === SHIPPED_KEYS.length, String(mine.length))
+check('seat: registers the "user" cell', mine.some((e) => e.options?.key === 'user'), mine.map((e) => e.options?.key).join(','))
+check('seat: registers the "steering" cell', mine.some((e) => e.options?.key === 'steering'), mine.map((e) => e.options?.key).join(','))
+check('seat: shadows both from below', mine.every((e) => e.__passed?.priority === -1), JSON.stringify(mine.map((e) => e.__passed?.priority)))
 // Without the shipped entry's locale namespace the renderer injects no `t` seat,
 // and the shipped bubble's action row crashes on `t is not a function`.
-check('seat: forwards the shipped locale seat', mine[0]?.__passed?.locale === 'chat', String(mine[0]?.__passed?.locale))
+check('seat: forwards the shipped locale seat', mine.every((e) => e.__passed?.locale === 'chat'), JSON.stringify(mine.map((e) => e.__passed?.locale)))
 check('seat: shipped bubble kept as the wrapped body', slots.__entries.some((e) => e.component === fakeShipped))
-const elected = slots.entriesOfSlot('conversation.chat.node')[0]
-check('seat: shim is the elected cell winner', elected?.component === mine[0]?.component)
+const elected = slots.entriesOfSlot('conversation.chat.node')
+check('seat: every cell elects a shim', elected.length === SHIPPED_KEYS.length, String(elected.length))
+check('seat: the shim wins each cell', elected.every((entry) => mine.some((ours) => ours.component === entry.component)))
 
 // --- 4. render path -----------------------------------------------------------
 /** Resolve function components until a host element appears (the stub does not render them). */
@@ -236,7 +272,7 @@ function resolve(element, depth = 0) {
   return element
 }
 
-const shim = mine[0].component
+const shim = shimFor(slots, 'user')
 const fakeT = (key) => key
 const tree = shim({ node: userNode(8, [text('你好')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
 check('render: returns host element', tree?.props?.className === 'dsh-edit-retry-host', tree?.props?.className)
@@ -324,6 +360,36 @@ stateCalls.length = 0
 const onImage = contextMenu(plainTarget)
 imageTree.props.onContextMenu(onImage)
 check('menu: opens for image messages', onImage.prevented && stateCalls.some((call) => call?.left === 100), JSON.stringify(stateCalls))
+
+// --- 4c. the steering cell ----------------------------------------------------
+// A prompt injected into a running turn is classified `steering` by the Chat
+// builder (message.ts claims it from the next-step inbox) and the seat dispatches
+// on that kind. Shadowing `user` alone therefore left exactly these messages with
+// the native menu — the reported bug. The cell must carry the SAME wrapper.
+const steeringShim = shimFor(slots, 'steering')
+check('steering: the cell is shadowed', typeof steeringShim === 'function')
+const steeringTree = steeringShim === undefined
+  ? undefined
+  : steeringShim({ node: steeringNode(21, [text('你在跑啥呢')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+check('steering: the wrapper carries the handler', typeof steeringTree?.props?.onContextMenu === 'function')
+check('steering: leads with the shipped bubble', steeringTree?.children?.[0]?.type === fakeShipped, String(steeringTree?.children?.[0]?.type?.name))
+stateCalls.length = 0
+const onSteering = contextMenu(plainTarget)
+steeringTree?.props?.onContextMenu?.(onSteering)
+check('steering: right-click opens the menu', onSteering.prevented && stateCalls.some((call) => call?.left === 100), JSON.stringify(stateCalls))
+
+// The two shims are separate components: each forwards the cell's own props and
+// each renders the shipped body it looked up for ITS key.
+check('steering: the two cells have distinct shims', steeringShim !== shim)
+resolve(steeringTree?.children?.[0])
+check('steering: forwards the t seat to the shipped bubble', shippedProps?.t === fakeT)
+
+// The menu on a steering message is the same menu: retry, edit, rule, toggle.
+useStateScript = [false, undefined, undefined, { left: 10, top: 20 }, false]
+const steeringMenuTree = steeringShim?.({ node: steeringNode(21, [text('你在跑啥呢')]), sessionId: 'session-x', t: fakeT, useWorkspaces })
+const steeringItems = (resolve(steeringMenuTree?.children?.[2])?.children ?? []).map((child) => resolve(child))
+check('steering: offers the same four rows', steeringItems.length === 4, String(steeringItems.length))
+check('steering: retry is enabled', steeringItems[0]?.props?.disabled === false, String(steeringItems[0]?.props?.disabled))
 
 // The open menu offers two entries — retry first, the editor second, then a rule
 // and the delete-source toggle — and choosing the second enters the editor.
@@ -502,7 +568,7 @@ const { slots: submitSlots } = runApply('lowest', 'chat', {
   sessions,
   uiWorkspace: { openSession: async (id) => { opened.push(id) } }
 })
-const submitShim = submitSlots.__entries.find((e) => e.component !== fakeShipped).component
+const submitShim = shimFor(submitSlots, 'user')
 
 /** Drive the shim into its editor and click submit. */
 async function submitVia(seq, value, cwd, workspaceId, armed = false, extra = []) {
@@ -681,7 +747,7 @@ const { slots: modelSlots } = runApply('lowest', 'chat', {
   uiWorkspace: { openSession: async () => {} },
   'remote.session': modelRemote
 })
-const modelShim = modelSlots.__entries.find((e) => e.component !== fakeShipped).component
+const modelShim = shimFor(modelSlots, 'user')
 
 /** Drive `modelShim`'s retry entry for one source/target selection pair. */
 async function retryWith(seq, source, target, value = '第二句') {
@@ -774,7 +840,7 @@ const { slots: noRemoteSlots } = runApply('lowest', 'chat', {
   sessions,
   uiWorkspace: { openSession: async () => {} }
 })
-const noRemoteShim = noRemoteSlots.__entries.find((e) => e.component !== fakeShipped).component
+const noRemoteShim = shimFor(noRemoteSlots, 'user')
 selectionsById = { 'session-1': { next: { provider: 'picked', model: 'big' } }, 'session-child': { next: { provider: 'old', model: 'old' } } }
 selectCalls.length = 0
 promptCalls.length = 0
